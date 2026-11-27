@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="update" path="." />
+    <!-- 模板/缓存项目分享: files/templates、files/cache_projects -->
+    <files-path name="files" path="." />
+</paths>

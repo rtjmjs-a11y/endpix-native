@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.otf binary
+*.ttf binary
+*.webp binary
+*.wav binary
+*.jar binary

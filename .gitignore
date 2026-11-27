@@ -1,0 +1,53 @@
+# Build outputs
+/build/
+/app/build/
+/.gradle/
+/.cxx/
+**/.cxx/
+.kotlin/
+/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Local SDK / signing / secrets
+local.properties
+*.jks
+*.keystore
+keystore.properties
+*.pem
+*.p12
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Root-level screenshots, logs and test artifacts (source tree uses app/src)
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.xml
+/*.txt
+/*.log
+/build_tmp/
+/exp*/
+/ref_test/
+/test*/
+**/cpp.bak-*
+*.bak-*
+*.tmp
+
+# Third-party assets that are not redistributed with this repository
+/app/src/main/jniLibs/arm64-v8a/libxray.so
+/app/src/main/assets/default_proxy_good.txt
+/app/src/main/assets/default_proxy_auto_sources.txt
+/app/src/main/assets/adhosts.txt
+/app/src/main/assets/fonts/DingMao9.ttf
+/app/src/main/assets/fonts/Tianwang19.ttf
+/app/src/main/assets/fonts/Vonwaon12.ttf
