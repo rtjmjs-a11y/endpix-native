@@ -24,6 +24,8 @@
 
 namespace endpix {
 
+std::string runCanvasBench();   // bench/canvas_bench.cpp (debug only)
+
 constexpr int THUMB = 48;      // 时间轴缩略图边长
 constexpr int MMTHUMB = 192;   // 小地图缩略图边长(更高采样; 仅在面板打开时生成)
 
@@ -2222,6 +2224,18 @@ void Engine::runDebugScript() {
             mip_.reset(&canvas_);
             screenFull_ = true;
             logline("mipreset");
+        } else if (cmd == "fastcompose") {
+            std::string v; ls >> v;
+            const bool on = !(v == "0" || v == "off" || v == "false");
+            raster::setFastComposeEnabled(on);
+            logline(std::string("fastcompose ") + (on ? "on" : "off"));
+        } else if (cmd == "plainpath") {
+            std::string v; ls >> v;
+            plainPathOn_ = !(v == "0" || v == "off" || v == "false");
+            screenFull_ = true;
+            logline(std::string("plainpath ") + (plainPathOn_ ? "on" : "off"));
+        } else if (cmd == "bench") {
+            logline(runCanvasBench());
         } else if (cmd == "clear") {
             for (int l = 0; l < canvas_.layers(); l++) canvas_.clearRect(l, 0, 0, canvas_.width() - 1, canvas_.height() - 1);
             logline("clear ok");
@@ -3978,12 +3992,7 @@ void Engine::drainInput() {
         }
         int cx = 0, cy = 0;
         bool inside = display_.screenToCanvas(e.x, e.y, &cx, &cy);
-        if (sel_.mode() == 1) {
-            lastInputT_ = std::chrono::steady_clock::now();   // 选区操作也算输入: 期间暂停后台搬移
-            sel_.handle(e.action, cx, cy);
-            if (sel_.takeMaskSkipped()) wandSkip_.fetch_add(1);
-            continue;
-        }
+        // 取色器优先于选区手势: 两色混合/取色器进入后, 即使用户当前是框选工具也能吸色
         // 取色器: 接下来 n 次点击画布拾取所有层合成后的可见色(两色混合 n=2)
         if (pickMode_.load()) {
             if (e.action != 0) continue;
@@ -4008,6 +4017,12 @@ void Engine::drainInput() {
                 pickRemain_.store(0);
                 pickMode_.store(false);
             }
+            continue;
+        }
+        if (sel_.mode() == 1) {
+            lastInputT_ = std::chrono::steady_clock::now();   // 选区操作也算输入: 期间暂停后台搬移
+            sel_.handle(e.action, cx, cy);
+            if (sel_.takeMaskSkipped()) wandSkip_.fetch_add(1);
             continue;
         }
         // 油漆桶: 按下只记落点, 抬手才填充。
@@ -5887,6 +5902,12 @@ void Engine::flushScreenDirty() {
     if (nd.empty()) return;
     const int tx = canvas_.tilesX();
     const int cw = canvas_.width(), ch = canvas_.height();
+    const float z = display_.zoom();
+    int visLevel = 0;
+    if (z < 1.0f) {
+        visLevel = (int)std::floor(std::log2(1.0f / std::max(z, 1e-6f)));
+        visLevel = std::max(0, std::min(visLevel, 5));
+    }
     if (nd.size() > 64) {
         // 大范围改动(整片填充等): 逐块 updateRect 会把同一批 mip 块重复重建几十次,
         // 改成一次 invalidateRect + 一个屏幕脏矩形, 下一帧按需重建可见块
@@ -5905,7 +5926,7 @@ void Engine::flushScreenDirty() {
         for (int ti : nd) {
             const int x = (ti % tx) * Canvas::TILE, y = (ti / tx) * Canvas::TILE;
             const int w = std::min(Canvas::TILE, cw - x), h = std::min(Canvas::TILE, ch - y);
-            mip_.updateRect(x, y, x + w - 1, y + h - 1);
+            mip_.updateRect(x, y, x + w - 1, y + h - 1, visLevel);
             markScreenRect(x, y, x + w - 1, y + h - 1);
         }
     }
@@ -6015,29 +6036,61 @@ void Engine::renderScreen() {
     if (measLoupe && magnifierOn_.load()) { x0 = 0; y0 = 0; x1 = vw - 1; y1 = vh - 1; }
     // 屏幕网格不再盖到放大镜窗口上(镜内网格由下面 CPU 按放大后的位置画)
     display_.clearLoupeRect();
+    const float zoom = display_.zoom();
+    int level = 0;
+    if (zoom < 1.0f) {
+        // 取偏细一级(floor): 宁可多采样, 也不要让 mip texel 比屏幕像素更粗
+        const int l = (int)std::floor(std::log2(1.0f / std::max(zoom, 1e-6f)));
+        level = std::max(0, std::min(l, 5));
+    }
+    const int cw = canvas_.width(), ch = canvas_.height();
+    // 回放: 项目画布视口不变, 只把合成源换成回放帧; 项目像素/选区/撤销完全不动
+    const auto replayImg = std::atomic_load(&replayImg_);
+    const bool replayOn = replayImg && replayImg->w > 0 && replayImg->h > 0 && cw > 0 && ch > 0;
+    // 捏合帧把棋盘格直接烘进屏幕缓冲, 与画布同一纹理/同一帧, 不会相对滑动。
+    const bool bakeChk = display_.zoomGestureActive() && !replayOn;
+    display_.setBakeChecker(bakeChk);
+    // 捏合/平移/整屏重绘: 先把本帧可见且缺失的 tile 用 ComposePool 并行构建好
+    // (每块只建一次, 后续帧命中缓存), 避免同步逐块构建卡顿。
+    bool prefetchVisible = !replayOn &&
+        (display_.zoomGestureActive() || screenFull_ ||
+         (long long)(x1 - x0 + 1) * (y1 - y0 + 1) > 200000);
+    int pfTx0 = 0, pfTy0 = 0, pfTx1 = -1, pfTy1 = -1;
+    if (prefetchVisible) {
+        float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
+        const float sx[4] = {(float)x0, (float)x1, (float)x0, (float)x1};
+        const float sy[4] = {(float)y0, (float)y0, (float)y1, (float)y1};
+        for (int i = 0; i < 4; i++) {
+            float ccx = 0.f, ccy = 0.f;
+            display_.screenToCanvasF(sx[i], sy[i], &ccx, &ccy);
+            mnx = std::min(mnx, ccx); mxx = std::max(mxx, ccx);
+            mny = std::min(mny, ccy); mxy = std::max(mxy, ccy);
+        }
+        const int span = MipPyramid::TS << level;
+        pfTx0 = std::max(0, (int)std::floor(mnx / span));
+        pfTy0 = std::max(0, (int)std::floor(mny / span));
+        pfTx1 = std::min(mip_.tilesX(level) - 1, (int)std::floor(mxx / span));
+        pfTy1 = std::min(mip_.tilesY(level) - 1, (int)std::floor(mxy / span));
+        std::vector<std::pair<int, int>> missing;
+        for (int ty = pfTy0; ty <= pfTy1; ty++)
+            for (int tx = pfTx0; tx <= pfTx1; tx++)
+                if (!mip_.hasTile(level, tx, ty)) missing.emplace_back(tx, ty);
+        if (!missing.empty()) {
+            pool_.run((int)missing.size(), [&](int i) {
+                mip_.tile(level, missing[i].first, missing[i].second);
+            });
+        }
+    }
     auto t0 = std::chrono::steady_clock::now();
     int stride = 0;
     uint32_t* p = display_.beginUpdate(x0, y0, x1 - x0 + 1, y1 - y0 + 1, &stride);
     if (!p) return;
-    const float zoom = display_.zoom();
-    int level = 0;
-    if (zoom < 1.0f) {
-        const int l = (int)std::lround(std::log2(1.0f / std::max(zoom, 1e-6f)));
-        level = std::max(0, std::min(l, 5));
-    }
-    // 双指捏合中先用较粗的 mip 级: 大画布缩放进新级别时不必同步构建大量 256² tile,
-    // 松手后再整屏重绘到精确级别(pn133)。
-    if (display_.zoomGestureActive()) level = std::max(level, 3);
     const bool cut = canvas_.cutActive();
     // 层感知剪切: 只挖空被剪层(cutLayer>=0)时 mip 已按层合成好, 屏幕不要再整块清零;
     // 旧"全部层"模式(cutLayer<0)仍整块隐藏(各层都进了浮层)。
     const bool cutHideAll = cut && canvas_.cutLayer() < 0;
     const int kx0 = canvas_.cutX0(), ky0 = canvas_.cutY0();
     const int kx1 = canvas_.cutX1(), ky1 = canvas_.cutY1();
-    const int cw = canvas_.width(), ch = canvas_.height();
-    // 回放: 项目画布视口不变, 只把合成源换成回放帧; 项目像素/选区/撤销完全不动
-    const auto replayImg = std::atomic_load(&replayImg_);
-    const bool replayOn = replayImg && replayImg->w > 0 && replayImg->h > 0 && cw > 0 && ch > 0;
     // 旧项目本层蒙版实时预览: 浮层落到"本层透明"的位置时半透明(45%)显示, 表示确认后不贴。
     // 普通裁剪浮层的源矩形在旧项目预览里先被清空, 源区也算透明。
     const bool maskPrev = canvas_.alphaLock();
@@ -6090,12 +6143,43 @@ void Engine::renderScreen() {
     const bool onNext = onionActive && !onionNext_.empty();
     const int rectW = x1 - x0 + 1;
     const int rectH = y1 - y0 + 1;
+    const bool plainCanvas = plainPathOn_ && !replayOn && !cut && !fv && !selExt && !selXf &&
+                             !lvOn && !onPrev && !onNext && !measLoupe;
     // 2.5D 视角旋转时, 屏幕 x 方向对应画布 (cos, -sin) 方向; 非旋转时退化为 (1,0)
     const float dCx = display_.rot25Cos() * invz;
     const float dCy = -display_.rot25Sin() * invz;
     auto renderBand = [&](int band, int bands) {
         const int syA = y0 + (rectH * band) / bands;
         const int syB = y0 + (rectH * (band + 1)) / bands - 1;
+        if (plainCanvas) {
+            for (int sy = syA; sy <= syB; sy++) {
+                float cxf = 0, cyf = 0;
+                display_.screenToCanvasF((float)x0, (float)sy, &cxf, &cyf);
+                uint32_t* drow = p + (size_t)(sy - y0) * stride;
+                int lastTx = INT_MIN, lastTy = INT_MIN;
+                const uint32_t* tile = nullptr;
+                for (int sx = x0; sx <= x1; sx++) {
+                    const float cx = cxf + (sx - x0) * dCx;
+                    const float cy = cyf + (sx - x0) * dCy;
+                    uint32_t v = 0;
+                    if (cx >= 0.f && cy >= 0.f && cx < (float)cw && cy < (float)ch) {
+                        const int icx = (int)cx, icy = (int)cy;
+                        const int lx = icx >> level, ly = icy >> level;
+                        const int tx = lx >> 8, ty = ly >> 8;
+                        if (tx != lastTx || ty != lastTy) {
+                            tile = mip_.tile(level, tx, ty); lastTx = tx; lastTy = ty;
+                        }
+                        if (tile) v = tile[((size_t)(ly & 255) << 8) + (lx & 255)];
+                    }
+                    if (bakeChk) {
+                        v = display_.bakeCheckerPixel(cx, cy,
+                            cx >= 0.f && cy >= 0.f && cx < (float)cw && cy < (float)ch, v);
+                    }
+                    drow[sx - x0] = v;
+                }
+            }
+            return;
+        }
         for (int sy = syA; sy <= syB; sy++) {
             float cxf = 0, cyf = 0;
             display_.screenToCanvasF((float)x0, (float)sy, &cxf, &cyf);
@@ -6184,12 +6268,19 @@ void Engine::renderScreen() {
                         if (f) raster::overPixel(v, f);
                     }
                 }
+                if (bakeChk) {
+                    v = display_.bakeCheckerPixel(cx, cy,
+                        cx >= 0.f && cy >= 0.f && cx < (float)cw && cy < (float)ch, v);
+                }
                 drow[sx - x0] = v;
             }
         }
     };
     if ((long)rectW * rectH > 200000) pool_.run(4, [&](int i) { renderBand(i, 4); });
     else renderBand(0, 1);
+    if (pfTx1 >= pfTx0 && pfTy1 >= pfTy0) {
+        mip_.trim(level, pfTx0, pfTy0, pfTx1, pfTy1);
+    }
     if (replayOn) {
         // 回放只画项目画布视口内的帧, 不叠加选区/网格/测距/Loupe 等编辑预览
         const bool uploaded = display_.endUpdate();

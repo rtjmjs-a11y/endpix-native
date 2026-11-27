@@ -20,6 +20,7 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     const int x0 = tx * TS * stride, y0 = ty * TS * stride;
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
+    const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
     for (int y = 0; y < TS; y++) {
         const int cy = y0 + y * stride;
         uint32_t* drow = buf.get() + (size_t)y * TS;
@@ -27,7 +28,8 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
         for (int x = 0; x < TS; x++) {
             const int cx = x0 + x * stride;
             if (cx >= cw) { drow[x] = 0; continue; }
-            drow[x] = raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+            drow[x] = fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
+                                  : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
         }
     }
     {
@@ -40,7 +42,7 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     }
 }
 
-void MipPyramid::updateRect(int x0, int y0, int x1, int y1) {
+void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!canvas_) return;
     x0 = std::max(0, x0); y0 = std::max(0, y0);
@@ -49,7 +51,9 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1) {
     if (x0 > x1 || y0 > y1) return;
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
+    const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
     for (int level = 0; level < 6; level++) {
+        const bool recompute = (visibleLevel < 0 || visibleLevel == level);
         const int span = TS << level;
         const int tx0 = x0 / span, tx1 = x1 / span;
         const int ty0 = y0 / span, ty1 = y1 / span;
@@ -57,6 +61,11 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1) {
             for (int tx = tx0; tx <= tx1; tx++) {
                 auto it = tiles_.find(key(level, tx, ty));
                 if (it == tiles_.end()) continue;
+                if (!recompute) {
+                    // 非可见级别不重算, 直接失效; 下次缩放/平移按需重建
+                    tiles_.erase(it);
+                    continue;
+                }
                 uint32_t* t = it->second.get();
                 const int bx = tx * span, by = ty * span;
                 const int lx0 = std::max(0, (x0 - bx) >> level);
@@ -68,12 +77,30 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1) {
                     for (int lx = lx0; lx <= lx1; lx++) {
                         const int cx = bx + (lx << level);
                         uint32_t acc = 0;
-                        if (cx < cw && cy < ch) acc = raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+                        if (cx < cw && cy < ch)
+                            acc = fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
+                                              : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
                         t[(size_t)ly * TS + lx] = acc;
                     }
                 }
             }
         }
+    }
+}
+
+void MipPyramid::trim(int visibleLevel, int tx0, int ty0, int tx1, int ty1,
+                      size_t maxTiles) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (tiles_.size() <= maxTiles) return;
+    for (auto it = tiles_.begin(); it != tiles_.end() && tiles_.size() > maxTiles;) {
+        const uint64_t k = it->first;
+        const int lv = (int)(k >> 42);
+        const int tx = (int)((k >> 21) & ((1u << 21) - 1));
+        const int ty = (int)(k & ((1u << 21) - 1));
+        const bool pinned = lv == visibleLevel &&
+                            tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1;
+        if (pinned) { ++it; continue; }
+        it = tiles_.erase(it);
     }
 }
 

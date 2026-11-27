@@ -206,16 +206,20 @@ fun PenSubmenu(
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Ep.Accent.copy(alpha = 0.2f), Ep.Accent)))
             }
-            Spacer(Modifier.height(4.dp))
+        }
+        if (isPen) {
+            // 完美线条/本层蒙版/叠色与笔刷高级系统无关, 不启用笔刷也始终显示
+            Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 SquareBtn(67, "完美线条", { onPerfectLine(!perfectLine) }, selected = perfectLine)
                 SquareBtn(57, "本层蒙版", { onAlphaLock(!alphaLock) }, selected = alphaLock)
                 SquareBtn(70, "叠色", { onBuildup(!buildup) }, selected = buildup)
             }
-        } else if (isPen) {
-            Spacer(Modifier.height(8.dp))
-            Text("启用笔刷后可调整完整笔刷系统（16 种预设、硬度/间距/散射/长宽比/角度/流量）",
-                color = Ep.Sub, fontSize = 8.5.sp, lineHeight = 12.sp)
+            if (!BrushHub.enabled) {
+                Spacer(Modifier.height(6.dp))
+                Text("启用笔刷后可调整完整笔刷系统（16 种预设、硬度/间距/散射/长宽比/角度/流量）",
+                    color = Ep.Sub, fontSize = 8.5.sp, lineHeight = 12.sp)
+            }
         }
     }
 }

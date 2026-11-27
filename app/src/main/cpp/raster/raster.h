@@ -41,6 +41,10 @@ uint32_t composeLayersPixel(const Canvas& c, int x, int y);
 // applyCut: 是否应用"剪切矩形只挖空被剪层"的蒙版(mip 构建必须 false, 否则浮层采样会读到空)
 uint32_t composeLayersPixelEx(const Canvas& c, int x, int y, bool showGrid, bool view25d,
                               bool applyCut = true);
+// 普通层快路径: 无蒙版/无2.5D/无平铺网格/不透明度100%/正常混合/不应用裁剪时可用
+bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, bool applyCut);
+uint32_t composeLayersPixelFast(const Canvas& c, int x, int y);
+void setFastComposeEnabled(bool on);   // 调试 A/B 对比用
 
 // 合成矩形: 目标 dst 行距 dstStride, 起点为 (x,y) 在目标缓冲中的位置
 void compositeRect(const Canvas& c, int nlayers, uint32_t* dst, int dstStride,

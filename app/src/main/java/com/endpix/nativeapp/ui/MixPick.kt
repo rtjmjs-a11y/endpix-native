@@ -8,11 +8,13 @@ import androidx.compose.runtime.mutableIntStateOf
 object MixPickHub {
     val stage = mutableIntStateOf(-1)
     val colorA = mutableIntStateOf(0)
+    val startSeq = mutableIntStateOf(0)   // 进入混合时的取色序号, 用于判断两次吸色是否同一轮
     var onStart: (() -> Unit)? = null
 
     fun reset() {
         stage.intValue = -1
         colorA.intValue = 0
+        startSeq.intValue = 0
     }
 }
 

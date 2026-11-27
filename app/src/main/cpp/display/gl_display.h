@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -83,6 +84,28 @@ public:
     // 套索/魔棒精确轮廓: 线段 x0,y0,x1,y1...(画布坐标); 空=回到 bbox 蚂蚁线
     void setSelectionOutline(const std::vector<int>& segs);
     void setOverlay(bool checker, bool grid);   // 棋盘格/网格开关
+    // 捏合期间把棋盘格直接烘进屏幕缓冲: 棋盘格与画布同一帧, 不会出现"棋盘格跟不上画布"
+    void setBakeChecker(bool on) { bakeChecker_ = on; }
+    inline uint32_t bakeCheckerPixel(float cx, float cy, bool inside, uint32_t v) const {
+        if (!bakeChecker_) return v;
+        float br = bgR_, bg = bgG_, bb = bgB_;
+        if (inside && chkOn_) {
+            const float cell = std::max(chkTile_ * zoom_, 4.0f);
+            const int chk = ((int)std::floor(cx * zoom_ / cell) +
+                             (int)std::floor(cy * zoom_ / cell)) & 1;
+            br = chk ? chkBR_ : chkAR_;
+            bg = chk ? chkBG_ : chkAG_;
+            bb = chk ? chkBB_ : chkAB_;
+        }
+        const float a = (float)((v >> 24) & 255u) / 255.0f;
+        const float r = (float)(v & 255u) / 255.0f;
+        const float g = (float)((v >> 8) & 255u) / 255.0f;
+        const float b = (float)((v >> 16) & 255u) / 255.0f;
+        const uint32_t rr = (uint32_t)std::lround((r * a + br * (1.0f - a)) * 255.0f);
+        const uint32_t gg = (uint32_t)std::lround((g * a + bg * (1.0f - a)) * 255.0f);
+        const uint32_t bb2 = (uint32_t)std::lround((b * a + bb * (1.0f - a)) * 255.0f);
+        return 0xFF000000u | (bb2 << 16) | (gg << 8) | rr;
+    }
     // 放大镜窗口(屏幕像素, 含边框): 网格不再盖到镜面上, 镜内由 CPU 画放大后的网格
     void setLoupeRect(int x0, int y0, int x1, int y1) {
         loupeOn_ = true; loupeX0_ = x0; loupeY0_ = y0; loupeX1_ = x1; loupeY1_ = y1;
@@ -152,6 +175,12 @@ private:
     int dw_ = 0, dh_ = 0;                      // 显示缓冲(屏幕)尺寸
     float zoom_ = 1.0f, panX_ = 0.0f, panY_ = 0.0f;
     float rot25Deg_ = 0.0f, rot25Cos_ = 1.0f, rot25Sin_ = 0.0f;
+    // 棋盘格/网格必须使用"屏幕缓冲里那一帧"的变换, 不能用正在变化的新变换;
+    // 否则超快速缩放时 CPU 还没画完新帧, 背景已经先动, 会露出棋盘格。
+    bool haveDrawFrame_ = false;
+    float drawZoom_ = 1.0f, drawPanX_ = 0.0f, drawPanY_ = 0.0f, drawRot25_ = 0.0f;
+    bool bakeChecker_ = false;   // 本帧是否把棋盘格烘进屏幕缓冲
+    bool drawBaked_ = false;     // 已上传那一帧是否是烘入棋盘格的; draw() 据此关着色器棋盘格
     bool viewReady_ = false;
     bool zoomGesture_ = false;
     float zgBaseZoom_ = 1.0f, zgCanvasX_ = 0.0f, zgCanvasY_ = 0.0f;

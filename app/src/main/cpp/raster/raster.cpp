@@ -1,11 +1,15 @@
 #include "raster.h"
 #include <arm_neon.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <climits>
 
 namespace endpix::raster {
+
+static std::atomic<bool> gFastCompose{true};
+void setFastComposeEnabled(bool on) { gFastCompose.store(on, std::memory_order_relaxed); }
 
 
 void over8(uint8_t* d, const uint8_t* s) {
@@ -182,6 +186,38 @@ uint32_t composeLayersPixelEx(const Canvas& c, int x, int y, bool showGrid, bool
                 raster::overPixel(acc, gc);
             }
         }
+    }
+    return acc;
+}
+
+// 普通层快路径: 只做可见层 over, 跳过每像素的图层属性/蒙版/2.5D 判断。
+// 只在语义与 composeLayersPixelEx 完全一致时使用(否则调用方回退)。
+bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, bool applyCut) {
+    if (!gFastCompose.load(std::memory_order_relaxed)) return false;
+    const int nl = c.layers();
+    if (nl <= 0) return false;
+    if (view25d) {
+        const Mode25D& g = mode25D();
+        if (g.on && g.depth > 0 && nl > 1) return false;
+    }
+    if (applyCut && c.cutActive()) return false;
+    for (int l = 0; l < nl; l++) {
+        if (!c.layerVisible(l)) continue;
+        if (c.layerMode(l) == 2) return false;
+        if (showGrid && c.layerMode(l) == 1) return false;
+        if (c.layerOpacity(l) < 0.999f) return false;
+        if (c.layerBlend(l) != 0) return false;
+    }
+    return true;
+}
+
+uint32_t composeLayersPixelFast(const Canvas& c, int x, int y) {
+    uint32_t acc = 0;
+    const int nl = c.layers();
+    for (int l = 0; l < nl; l++) {
+        if (!c.layerVisible(l)) continue;
+        const uint32_t v = c.getPixelL(l, x, y);
+        if (v) overPixel(acc, v);
     }
     return acc;
 }

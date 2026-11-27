@@ -88,10 +88,10 @@ object PaletteHub {
 
 @Composable
 fun ColorOptionsMenu(modifier: Modifier = Modifier, onPick: () -> Unit, onMix: () -> Unit, onHsv: () -> Unit) {
-    // 旧项目 ShowColorOptionsMenu: 色块左侧并排图标按钮 [取色器][两色混合][HSV]
+    // 旧项目 ShowColorOptionsMenu: 色块左侧并排图标按钮 [两色混合][取色器][HSV]
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        ColorMenuBtn(20, onPick)
         TwoColorMixButton(onMix)
+        ColorMenuBtn(20, onPick)
         ColorMenuBtn(21, onHsv)
     }
 }

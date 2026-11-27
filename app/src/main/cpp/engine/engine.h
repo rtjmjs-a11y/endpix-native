@@ -440,6 +440,7 @@ private:
     MipPyramid mip_;
     bool screenFull_ = true;
     int fullBurst_ = 0;   // 尺寸/旋转后的强制整屏重绘帧数(防首帧上传失败留下空白缓冲)
+    bool plainPathOn_ = true;   // 调试 A/B: 纯画布快路径
     std::atomic<bool> redrawReq_{false};
     std::atomic<bool> grayView_{false};   // 灰度观看(屏幕 shader), 不改像素
     // 小地图点击: 视角平滑动画(旧 PanToCanvasPixelAnimated, SmoothDamp 0.15s)

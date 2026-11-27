@@ -53,7 +53,7 @@ static const char* FS =
     "  vec3 crgb = mix(c.rgb, vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114))), uGray);\n"
     "  vec2 q = gl_FragCoord.xy - uCenter;\n"
     "  float rc = cos(uRot), rs = sin(uRot);\n"
-    "  vec2 rq = vec2(rc*q.x + rs*q.y, -rs*q.x + rc*q.y);\n"
+    "  vec2 rq = vec2(rc*q.x - rs*q.y, rs*q.x + rc*q.y);\n"
     "  vec2 fc = uCenter + rq;\n"
     "  float cx = (fc.x - 0.5 - uOrigin.x) / uZoom;\n"
     "  float cy = (uOrigin.y - fc.y - 0.5) / uZoom;\n"
@@ -340,6 +340,7 @@ void GlDisplay::onSize(int w, int h) {
         useAhb_ = false;
         dw_ = w; dh_ = h; texW_ = w; texH_ = h;
         if (dpy_ != EGL_NO_DISPLAY) createTexture();
+        haveDrawFrame_ = false;
         if (wasReady) {
             const float aw = (float)std::max(1, w - inL_ - inR_);
             const float ah = (float)std::max(1, h - inT_ - inB_);
@@ -508,6 +509,13 @@ bool GlDisplay::endUpdate() {
         glTexSubImage2D(GL_TEXTURE_2D, 0, upX_, upY_, upW_, upH_, GL_RGBA, GL_UNSIGNED_BYTE, upPtr_);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
+    // 这一帧已真正进入屏幕缓冲; 棋盘格/网格跟随这一帧的变换, 不跟正在变化的 zoom_/pan_
+    drawZoom_ = zoom_;
+    drawPanX_ = panX_;
+    drawPanY_ = panY_;
+    drawRot25_ = rot25Deg_;
+    drawBaked_ = bakeChecker_;
+    haveDrawFrame_ = true;
     return true;
 }
 
@@ -697,10 +705,15 @@ void GlDisplay::draw() {
     // 合成按屏幕像素的"左上角"映射画布坐标(cx=(sx-inL)/zoom+panX), 所以画布覆盖的屏幕像素是
     // ceil(left)..ceil(right)-1 / ceil(top)..ceil(bottom)-1。之前用 floor/ceil 外扩,
     // 画布上边/左边会多出一像素: 该像素合成是透明的(0), 着色器却判 inside 画出棋盘格 → "棋盘格的缝"。
-    const float cl = (0.0f - panX_) * zoom_ + (float)inL_;
-    const float ct = (0.0f - panY_) * zoom_ + (float)inT_;
-    const float cr = ((float)cw_ - panX_) * zoom_ + (float)inL_;
-    const float cb = ((float)ch_ - panY_) * zoom_ + (float)inT_;
+    // 棋盘格/网格/画布边界使用"已上传屏幕帧"的变换; 未上传过帧时才用实时变换。
+    const float dz = haveDrawFrame_ ? drawZoom_ : zoom_;
+    const float dpx = haveDrawFrame_ ? drawPanX_ : panX_;
+    const float dpy = haveDrawFrame_ ? drawPanY_ : panY_;
+    const float drot = haveDrawFrame_ ? drawRot25_ : rot25Deg_;
+    const float cl = (0.0f - dpx) * dz + (float)inL_;
+    const float ct = (0.0f - dpy) * dz + (float)inT_;
+    const float cr = ((float)cw_ - dpx) * dz + (float)inL_;
+    const float cb = ((float)ch_ - dpy) * dz + (float)inT_;
     const int ix0 = (int)std::ceil(cl);
     const int iy0 = (int)std::ceil(ct);
     const int ix1 = (int)std::ceil(cr) - 1;
@@ -708,15 +721,15 @@ void GlDisplay::draw() {
     // 传给着色器的界用像素中心坐标(+0.5), 与 gl_FragCoord 一致
     glUniform4f(uCanvasRect_, (float)ix0 + 0.5f, (float)vh_ - (float)iy1 - 0.5f,
                 (float)ix1 + 0.5f, (float)vh_ - (float)iy0 - 0.5f);
-    const float orgX = (0.0f - panX_) * zoom_ + (float)inL_;
-    const float orgY = (0.0f - panY_) * zoom_ + (float)inT_;
+    const float orgX = (0.0f - dpx) * dz + (float)inL_;
+    const float orgY = (0.0f - dpy) * dz + (float)inT_;
     glUniform2f(uOrigin_, orgX, (float)vh_ - orgY);
-    glUniform1f(uZoom_, zoom_);
+    glUniform1f(uZoom_, dz);
     // 2.5D 视角旋转: 棋盘格/网格/画布边界跟着内容一起转
-    glUniform1f(uRot_, rot25Deg_ * 3.14159265358979f / 180.0f);
-    glUniform2f(uCenter_, orgX + cw_ * 0.5f * zoom_, (float)vh_ - orgY - ch_ * 0.5f * zoom_);
+    glUniform1f(uRot_, drot * 3.14159265358979f / 180.0f);
+    glUniform2f(uCenter_, orgX + cw_ * 0.5f * dz, (float)vh_ - orgY - ch_ * 0.5f * dz);
     glUniform2f(uCanvasSize_, (float)cw_, (float)ch_);
-    glUniform1f(uChkOn_, chkOn_ ? 1.0f : 0.0f);
+    glUniform1f(uChkOn_, (chkOn_ && !drawBaked_) ? 1.0f : 0.0f);
     glUniform1f(uGridOn_, gridOn_ ? 1.0f : 0.0f);
     glUniform1f(uGridW_, gridW_);
     glUniform1f(uGridH_, gridH_);

@@ -3095,6 +3095,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             MixPickHub.onStart = {
                 MixPickHub.stage.intValue = 0
                 MixPickHub.colorA.intValue = 0
+                MixPickHub.startSeq.intValue = lastPickSeq
                 pickingState.value = true
                 nativeSetPickMode(2)
             }
@@ -3273,7 +3274,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 val m = nativeMeasUi()
                                 if (!m.contentEquals(measUiState.value)) measUiState.value = m
                             } catch (_: Throwable) { }
-                            delay(16)
+                            val fastPoll = (selFlagState.intValue and 1) != 0 ||
+                                (toolState.intValue == 4 && shapeTypeState.intValue == 6) ||
+                                com.endpix.nativeapp.ui.GradHub.active
+                            delay(if (fastPoll) 16 else 50)
                         }
                     }
                     LaunchedEffect(Unit) {
@@ -4090,8 +4094,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         Regex("""L\d+ A(\d+)""").find(s)?.groupValues?.get(1)?.toIntOrNull()?.let { activeState.intValue = it }
         val pseq = grab("""pseq=(\d+)""") ?: 0
         if (pseq != lastPickSeq) {
-            val delta = (pseq - lastPickSeq).coerceAtLeast(1)
             lastPickSeq = pseq
+            val mixN = pseq - MixPickHub.startSeq.intValue
             val pick = Regex("""pick=([0-9A-Fa-f]{8})""").find(s)?.groupValues?.get(1)
                 ?.toLongOrNull(16)?.toInt()
             val pickPrev = Regex("""pickprev=([0-9A-Fa-f]{8})""").find(s)?.groupValues?.get(1)
@@ -4102,7 +4106,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     0 -> {
                         // 两色混合第一色: 只记录, 不改画笔; 继续等待第二色。
                         // 若两次吸色都发生在 2Hz stats 轮询间隔内, 用 pickprev 补上第一色。
-                        if (delta >= 2 && pickPrev != null) {
+                        if (mixN >= 2 && pickPrev != null) {
                             applyMixColor(toNativeColor(pickPrev), c)
                         } else {
                             MixPickHub.colorA.intValue = c

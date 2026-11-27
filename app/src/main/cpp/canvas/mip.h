@@ -29,11 +29,21 @@ public:
 
     // 取(必要时构建)某级某块; 越界返回 nullptr
     const uint32_t* tile(int level, int tx, int ty);
+    bool hasTile(int level, int tx, int ty) {
+        if (!canvas_ || level < 0 || tx < 0 || ty < 0) return false;
+        if (tx >= tilesX(level) || ty >= tilesY(level)) return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        return tiles_.find(key(level, tx, ty)) != tiles_.end();
+    }
 
     // 画布矩形变脏: 逐级丢弃受影响的块, 下次按需重建
     void invalidateRect(int x0, int y0, int x1, int y1);
     // 已缓存的块只重算受影响的像素(编辑时用, 不整块重建)
-    void updateRect(int x0, int y0, int x1, int y1);
+    // visibleLevel>=0: 只重算当前可见级别, 其它级别直接失效, 下次按需重建
+    void updateRect(int x0, int y0, int x1, int y1, int visibleLevel = -1);
+    // 内存上限: 只保留当前可见级别/视口附近的块, 其余按 map 顺序淘汰
+    void trim(int visibleLevel, int tx0, int ty0, int tx1, int ty1,
+              size_t maxTiles = 1536);   // 1536×256KB ≈ 384MB
 
     size_t bytes() const {
         size_t n = 0;
