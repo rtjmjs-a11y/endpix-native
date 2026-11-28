@@ -68,8 +68,10 @@ struct LayerData {
 
 } // namespace
 
-PsdResult exportPsd(const Canvas& c, const std::string& path) {
+PsdResult exportPsd(const Canvas& c, const std::string& path, const std::atomic<bool>* abort) {
     PsdResult r;
+    std::atomic<bool> aborted{false};
+    auto abortNow = [&] { return abort && abort->load(std::memory_order_relaxed); };
     const auto t0 = std::chrono::steady_clock::now();
     const int W = c.width(), H = c.height(), n = c.layers();
     if (W <= 0 || H <= 0 || n <= 0) { r.err = "empty"; return r; }
@@ -92,6 +94,7 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
             const int y0 = (int)((long long)H * b / bands);
             const int y1 = (int)((long long)H * (b + 1) / bands);
             for (int y = y0; y < y1; y++) {
+                if ((y & 63) == 0 && abortNow()) { aborted.store(true); return; }
                 for (int l = 0; l < n; l++) {
                     LayerData& ld = layers[(size_t)l];
                     const bool vis = ld.visible;
@@ -117,6 +120,7 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
             }
         }, 4);
     }
+    if (aborted.load()) { r.err = "aborted"; return r; }
 
     // 每层每通道: compression=1(RLE) + 行长度表 + 数据(层/通道互相独立, 并行打包)
     std::vector<std::vector<uint8_t>> packed((size_t)n * 4);
@@ -129,6 +133,7 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
         const size_t tablePos = chBuf.size();
         chBuf.resize(chBuf.size() + (size_t)H * 2);
         for (int y = 0; y < H; y++) {
+            if ((y & 63) == 0 && abortNow()) { aborted.store(true); return; }
             rows[(size_t)y] = rleRow(layers[(size_t)l].plane[ch].data() + (size_t)y * W, W);
             const size_t len = rows[(size_t)y].size();
             chBuf[tablePos + (size_t)y * 2] = (uint8_t)((len >> 8) & 255);
@@ -139,6 +144,7 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
             chBuf.insert(chBuf.end(), row.begin(), row.end());
         }
     }, 4);
+    if (aborted.load()) { r.err = "aborted"; return r; }
 
     // 图层信息段
     std::vector<uint8_t> li;

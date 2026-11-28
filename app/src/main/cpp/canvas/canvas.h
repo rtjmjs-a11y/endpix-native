@@ -239,6 +239,13 @@ public:
         return n;
     }
     void installTile(int layer, int ti, const uint32_t* px, uint32_t solidColor, bool solid);
+    // 异步切帧: 只交换像素 tile 数据(图层名/属性/尺寸留在当前画布), 隐藏层计数随手更新
+    void swapTileData(Canvas& o) {
+        tiles_.swap(o.tiles_);
+        solidFlag_.swap(o.solidFlag_);
+        solidCol_.swap(o.solidCol_);
+        rev_++;
+    }
     void markDirtyTile(int ti);
     void markDirtyRect(int x0, int y0, int x1, int y1);
     // 只标矩形内"有实际 tile 数据"的块: 空白块的重合成结果和现在一样, 没必要刷

@@ -415,6 +415,23 @@ private:
     std::condition_variable exCv_;
     bool exPending_ = false, exDone_ = false;
     std::unique_ptr<PngExporter> pngJob_;   // 增量 PNG 导出(渲染线程每帧切一段)
+    // 导出/切帧后台任务: 画布进入只读状态(渲染继续, 输入/画布写入延后), 任务在工作线程跑
+    std::atomic<bool> canvasBusy_{false};
+    std::atomic<bool> exportBusy_{false};
+    std::atomic<bool> exportAbort_{false};
+    std::thread exportTh_;
+    std::thread dbgExportTh_;   // 调试命令 exportasync 的调用线程(模拟 Kotlin IO 协程)
+    // 异步切帧: 工作线程序列化旧帧 + 反序列化新帧到临时 Canvas, 渲染线程一次 swap
+    std::thread frameTh_;
+    std::mutex frameMu_;
+    std::atomic<bool> frameBusy_{false};
+    std::atomic<bool> frameReady_{false};
+    int frameOld_ = -1, frameTarget_ = -1;
+    std::vector<uint8_t> frameOut_;
+    std::unique_ptr<Canvas> frameTmp_;
+    void startFrameSwitch(int idx);
+    void finishFrameSwitch();
+    void joinExportJobs();   // 停止前等待后台导出完成(带 abort)
     std::atomic<bool> lvPending_{false};
     std::chrono::steady_clock::time_point measDownT_{};
     bool measMagShown_ = false;
@@ -454,6 +471,8 @@ private:
     int fullBurst_ = 0;   // 尺寸/旋转后的强制整屏重绘帧数(防首帧上传失败留下空白缓冲)
     bool plainPathOn_ = true;   // 调试 A/B: 纯画布快路径
     bool runFillOn_ = true;     // 调试 A/B: 放大时按"画布像素→屏幕段"整段填充
+    bool idleSleepOn_ = true;   // 空闲不重画 + 小睡(省空转), 调试可关
+    std::chrono::steady_clock::time_point lastPresentT_{};   // 空闲前再热 400ms, 避免刚停手就降频/冷缓存
     std::atomic<bool> redrawReq_{false};
     std::atomic<bool> grayView_{false};   // 灰度观看(屏幕 shader), 不改像素
     // 小地图点击: 视角平滑动画(旧 PanToCanvasPixelAnimated, SmoothDamp 0.15s)
@@ -751,6 +770,9 @@ private:
     std::chrono::steady_clock::time_point drainT0_;
     std::atomic<int> compUs_{0};
     std::atomic<int> bandUs_{0}, upUs_{0};   // 调试: 整屏合成分带耗时 / AHB 上传耗时
+    std::atomic<long long> loopTicks_{0};    // 渲染循环心跳(验证后台导出/切帧期间主循环没停)
+    std::atomic<int> lastExportMs_{0}, lastExportTicks_{0};
+    std::atomic<int> lastFrameSwitchMs_{0}, lastFrameSwitchTicks_{0};
     std::atomic<int> lastRawX_{0}, lastRawY_{0}, lastCvX_{0}, lastCvY_{0}, lastAct_{-1};
     std::atomic<int> cntDown_{0}, cntMove_{0}, cntUp_{0}, cntStamp_{0};
     std::atomic<int> prevX_{-1}, prevY_{-1}, curX_{-1}, curY_{-1}, prevDelta_{-1};
