@@ -2500,7 +2500,9 @@ private fun MinimapPanel(
     var posY by remember(yDp) { mutableFloatStateOf(yDp) }
     val nav by rememberUpdatedState(onNavigate)
     val posCb by rememberUpdatedState(onPos)
-    val bmp by produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, frameIdx, activeLayer, version) {
+    // 2.5D 视角拖动时小地图要跟着转: 原生 30Hz 更新 rev, 只重组面板本身
+    val hotRev = MinimapNavHub.rev.intValue
+    val bmp by produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, frameIdx, activeLayer, version, hotRev) {
         // 优先 192×192 小地图采样; 引擎还没生成时回退到时间轴 48 缩略图
         val mm = try { minimapThumb() } catch (_: Throwable) { IntArray(0) }
         if (mm.size >= 192 * 192) {
@@ -2558,7 +2560,10 @@ private fun MinimapPanel(
                                 if (now - lastNavMs < 33L) return
                                 lastNavMs = now
                             }
-                            nav(nx * canvasW, ny * canvasH, animate)
+                            // 2.5D 时缩略图整体旋转, 点击点先逆旋转回画布坐标
+                            val c = MinimapNavHub.convert?.invoke(nx, ny)
+                            if (c != null && c.size >= 2) nav(c[0], c[1], animate)
+                            else nav(nx * canvasW, ny * canvasH, animate)
                         }
                         while (true) {
                             val ev = awaitPointerEvent()

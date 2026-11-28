@@ -520,6 +520,14 @@ Java_com_endpix_nativeapp_MainActivity_nativeMinimapViewport(JNIEnv* env, jobjec
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_endpix_nativeapp_MainActivity_nativeMinimapPoint(JNIEnv* env, jobject, jfloat nx, jfloat ny, jfloatArray out) {
+    if (!out || env->GetArrayLength(out) < 2) return;
+    float v[2] = {nx, ny};
+    if (gEngine) gEngine->minimapPointToCanvas(nx, ny, v);
+    env->SetFloatArrayRegion(out, 0, 2, v);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_endpix_nativeapp_MainActivity_nativeAnimateViewCenter(JNIEnv*, jobject, jfloat cx, jfloat cy, jint animate) {
     if (gEngine) gEngine->requestAnimateViewCenter(cx, cy, animate != 0);
 }

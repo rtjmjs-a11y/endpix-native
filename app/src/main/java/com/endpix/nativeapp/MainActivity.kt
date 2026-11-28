@@ -2537,6 +2537,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         prefs = getSharedPreferences("endpix", MODE_PRIVATE)
+        // 小地图点击: 2.5D 旋转时由原生按同一 bbox 做逆旋转
+        com.endpix.nativeapp.ui.MinimapNavHub.convert = { nx, ny ->
+            val o = FloatArray(2)
+            try { nativeMinimapPoint(nx, ny, o) } catch (_: Throwable) { }
+            o
+        }
         // 系统截屏: 立即收起横屏菜单/☰(Android 14+ 有系统回调; 三指截图另有触摸预判)
         if (android.os.Build.VERSION.SDK_INT >= 34) {
             try {
@@ -3239,6 +3245,22 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 if (r != thumbRevState.intValue) thumbRevState.intValue = r
                             } catch (_: Throwable) { }
                             delay(500)   // 2Hz: 全屏 stats 重组更少, 悬浮窗拖动/绘制更稳
+                        }
+                    }
+                    // 小地图 2.5D 旋转: 面板打开时 30Hz 查缩略图版本。
+                    // 只写 MinimapNavHub(面板自己重组), 不走 MainScreen 的 thumbRev 参数, 避免整屏重组。
+                    LaunchedEffect(Unit) {
+                        while (true) {
+                            if (minimapOnState.value) {
+                                try {
+                                    val r = nativeThumbRevision()
+                                    if (r != com.endpix.nativeapp.ui.MinimapNavHub.rev.intValue)
+                                        com.endpix.nativeapp.ui.MinimapNavHub.rev.intValue = r
+                                } catch (_: Throwable) { }
+                                delay(33)
+                            } else {
+                                delay(300)
+                            }
                         }
                     }
                     // 选区面板跟手: 60Hz 轻量轮询(不是 stats)
@@ -4782,6 +4804,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private external fun nativeExportThumb(): IntArray?
     private external fun nativeSetMinimapActive(on: Int)
     private external fun nativeMinimapViewport(out: FloatArray)
+    private external fun nativeMinimapPoint(nx: Float, ny: Float, out: FloatArray)
     private external fun nativeAnimateViewCenter(cx: Float, cy: Float, animate: Int)
     private external fun nativeSetLoopRange(start: Int, end: Int)
     private external fun nativeReorderFrame(from: Int, to: Int)

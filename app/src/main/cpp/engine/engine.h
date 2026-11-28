@@ -135,6 +135,8 @@ public:
     }
     // 小地图红框: 屏幕视口在画布中的归一化矩形(旧 UpdateViewport 的本地化; UI 每帧查询)
     void minimapViewportNormalized(float* out);
+    // 小地图归一化坐标 → 画布坐标(2.5D 旋转时逆变换, 与缩略图/红框同一套 bbox)
+    void minimapPointToCanvas(float nx, float ny, float* out);
     void setViewState(float z, float px, float py) {
         display_.setView(z, px, py);
         screenFull_ = true;

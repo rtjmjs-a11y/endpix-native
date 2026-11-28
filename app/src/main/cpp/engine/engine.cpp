@@ -1417,41 +1417,89 @@ void Engine::refreshFrameThumbs() {
 }
 
 // 小地图缩略图: 全可见层合成, 192×192 采样(块内最多 4×4 个采样点, 大画布也不爆)
+// 2.5D 开启时输出"旋转后的画布 bbox 铺满格子"的缩略图(含层错位), 与主画布一致;
+// 红框分数基于同一个旋转 bbox, 所以不用改 UI 也保持对齐。
 void Engine::refreshMinimapThumb() {
     std::vector<uint32_t> tmp((size_t)MMTHUMB * MMTHUMB, 0u);
+    const raster::Mode25D& g25 = raster::mode25D();
+    const bool use25 = g25.on && (g25.depth > 0 || std::fabs(g25.yawDeg) > 0.01f);
     if (canvas_.layers() > 0) {
         const int w = canvas_.width(), h = canvas_.height();
-        for (int ty = 0; ty < MMTHUMB; ty++) {
-            const int sy0 = (int)((long long)ty * h / MMTHUMB);
-            int sy1 = (int)((long long)(ty + 1) * h / MMTHUMB);
-            if (sy1 <= sy0) sy1 = sy0 + 1;
-            const int syStep = std::max(1, (sy1 - sy0 + 3) / 4);
-            for (int tx = 0; tx < MMTHUMB; tx++) {
-                const int sx0 = (int)((long long)tx * w / MMTHUMB);
-                int sx1 = (int)((long long)(tx + 1) * w / MMTHUMB);
-                if (sx1 <= sx0) sx1 = sx0 + 1;
-                const int sxStep = std::max(1, (sx1 - sx0 + 3) / 4);
-                uint32_t best = 0;
-                int bestA = 0;
-                for (int yy = sy0; yy < sy1; yy += syStep) {
-                    for (int xx = sx0; xx < sx1; xx += sxStep) {
-                        uint32_t acc = 0;
-                        const int nl = canvas_.layers();
-                        for (int l = 0; l < nl; l++) {
-                            if (!canvas_.layerVisible(l)) continue;
-                            const uint32_t v = raster::layerPixel(canvas_, l, xx, yy);
-                            if (v) raster::overPixel(acc, v);
-                        }
-                        const int a = (int)(acc >> 24);
-                        if (a > bestA) { bestA = a; best = acc; }
-                    }
+        if (use25) {
+            const float rad = g25.yawDeg * 3.14159265358979f / 180.f;
+            const float rc = std::cos(rad), rs = std::sin(rad);
+            const float bbox = std::fabs(rc) + std::fabs(rs);   // 旋转后 bbox 占归一化空间的边长
+            for (int ty = 0; ty < MMTHUMB; ty++) {
+                for (int tx = 0; tx < MMTHUMB; tx++) {
+                    // 每格 1 个中心采样: 2.5D 拖动时 30Hz 重建, 控制耗时(~0.5ms/6层)
+                    const float nx = (tx + 0.5f) / MMTHUMB - 0.5f;
+                    const float ny = (ty + 0.5f) / MMTHUMB - 0.5f;
+                    const float u = nx * bbox, v = ny * bbox;
+                    // 逆旋转(与 GlDisplay::screenToCanvasF 同向): 从旋转后的 bbox 回到画布
+                    const float px = rc * u + rs * v;
+                    const float py = -rs * u + rc * v;
+                    const int ix = (int)std::floor((px + 0.5f) * w);
+                    const int iy = (int)std::floor((py + 0.5f) * h);
+                    if (ix < 0 || iy < 0 || ix >= w || iy >= h) continue;
+                    tmp[(size_t)ty * MMTHUMB + tx] =
+                        raster::composeLayersPixelEx(canvas_, ix, iy, true, true, false);
                 }
-                tmp[(size_t)ty * MMTHUMB + tx] = best;
+            }
+        } else {
+            for (int ty = 0; ty < MMTHUMB; ty++) {
+                const int sy0 = (int)((long long)ty * h / MMTHUMB);
+                int sy1 = (int)((long long)(ty + 1) * h / MMTHUMB);
+                if (sy1 <= sy0) sy1 = sy0 + 1;
+                const int syStep = std::max(1, (sy1 - sy0 + 3) / 4);
+                for (int tx = 0; tx < MMTHUMB; tx++) {
+                    const int sx0 = (int)((long long)tx * w / MMTHUMB);
+                    int sx1 = (int)((long long)(tx + 1) * w / MMTHUMB);
+                    if (sx1 <= sx0) sx1 = sx0 + 1;
+                    const int sxStep = std::max(1, (sx1 - sx0 + 3) / 4);
+                    uint32_t best = 0;
+                    int bestA = 0;
+                    for (int yy = sy0; yy < sy1; yy += syStep) {
+                        for (int xx = sx0; xx < sx1; xx += sxStep) {
+                            uint32_t acc = 0;
+                            const int nl = canvas_.layers();
+                            for (int l = 0; l < nl; l++) {
+                                if (!canvas_.layerVisible(l)) continue;
+                                const uint32_t v = raster::layerPixel(canvas_, l, xx, yy);
+                                if (v) raster::overPixel(acc, v);
+                            }
+                            const int a = (int)(acc >> 24);
+                            if (a > bestA) { bestA = a; best = acc; }
+                        }
+                    }
+                    tmp[(size_t)ty * MMTHUMB + tx] = best;
+                }
             }
         }
     }
     std::lock_guard<std::mutex> lk(thumbMu_);
     minimapThumb_.swap(tmp);
+}
+
+// 小地图点击 → 画布坐标(2.5D 时做同样的逆旋转; UI 拖动/点击都走这里)
+void Engine::minimapPointToCanvas(float nx, float ny, float* out) {
+    if (!out) return;
+    const float w = (float)std::max(1, canvas_.width());
+    const float h = (float)std::max(1, canvas_.height());
+    const raster::Mode25D& g25 = raster::mode25D();
+    const bool use25 = g25.on && (g25.depth > 0 || std::fabs(g25.yawDeg) > 0.01f);
+    if (!use25) {
+        out[0] = nx * w;
+        out[1] = ny * h;
+        return;
+    }
+    const float rad = g25.yawDeg * 3.14159265358979f / 180.f;
+    const float rc = std::cos(rad), rs = std::sin(rad);
+    const float bbox = std::fabs(rc) + std::fabs(rs);
+    const float u = (nx - 0.5f) * bbox, v = (ny - 0.5f) * bbox;
+    const float px = rc * u + rs * v;
+    const float py = -rs * u + rc * v;
+    out[0] = (px + 0.5f) * w;
+    out[1] = (py + 0.5f) * h;
 }
 
 bool Engine::minimapThumb(uint32_t* out, int n) {
@@ -1999,6 +2047,11 @@ void Engine::applyYaw25D(float deg) {
     raster::setYaw25D(deg);
     display_.setRotation25(deg);
     mip_.invalidateRect(0, 0, canvas_.width() - 1, canvas_.height() - 1);
+    // 小地图跟着旋转: 缩略图是"旋转后的画布 bbox 铺满格子", 红框分数不变仍对齐
+    if (minimapActive_.load(std::memory_order_relaxed)) {
+        refreshMinimapThumb();
+        thumbRev_.fetch_add(1, std::memory_order_relaxed);
+    }
     screenFull_ = true;
 }
 
@@ -2612,6 +2665,20 @@ void Engine::runDebugScript() {
             char bb[128];
             snprintf(bb, sizeof bb, "s2c %g,%g -> %d,%d inside=%d zoom=%.3f", sx, sy, ccx, ccy, in ? 1 : 0, display_.zoom());
             logline(bb);
+        } else if (cmd == "view") {
+            const auto& g25 = raster::mode25D();
+            char bb[192];
+            snprintf(bb, sizeof bb, "view zoom=%.4f pan=%.1f,%.1f yaw=%.1f on=%d depth=%d mm=%d",
+                     display_.zoom(), display_.panX(), display_.panY(), g25.yawDeg,
+                     g25.on ? 1 : 0, g25.depth, minimapActive_.load() ? 1 : 0);
+            logline(bb);
+        } else if (cmd == "setview") {
+            float z = 1.f, pxx = 0.f, pyy = 0.f;
+            ls >> z >> pxx >> pyy;
+            viewAnimActive_ = false;
+            display_.setView(z, pxx, pyy);
+            screenFull_ = true;
+            logline("setview " + std::to_string(z) + " " + std::to_string(pxx) + " " + std::to_string(pyy));
         } else if (cmd == "clearrect") {
             int ax = 0, ay = 0, bx = 0, by = 0; ls >> ax >> ay >> bx >> by;
             canvas_.clearRect(canvas_.active(), ax, ay, bx, by);
@@ -3249,7 +3316,8 @@ void Engine::drainInput() {
                         std::chrono::steady_clock::now().time_since_epoch()).count();
                     if (now - yawLastT25_ >= 33) {
                         yawLastT25_ = now;
-                        float ny = g25.yawDeg + dx * 0.5f;
+                        // 手往右拖 = 画布逆时针转(与手指方向一致); 之前是 +dx 导致反向
+                        float ny = g25.yawDeg - dx * 0.5f;
                         ny = std::fmod(ny, 360.f);
                         if (ny < 0.f) ny += 360.f;
                         applyYaw25D(ny);
@@ -3736,6 +3804,10 @@ void Engine::drainInput() {
             m25DepthA_.store(depth, std::memory_order_relaxed);
             m25DirA_.store(dir, std::memory_order_relaxed);
             mip_.invalidateRect(0, 0, canvas_.width() - 1, canvas_.height() - 1);
+            if (minimapActive_.load(std::memory_order_relaxed)) {
+                refreshMinimapThumb();
+                thumbRev_.fetch_add(1, std::memory_order_relaxed);
+            }
             screenFull_ = true;
             layerMetaRev_++;
             refreshLayerPropsCache();
