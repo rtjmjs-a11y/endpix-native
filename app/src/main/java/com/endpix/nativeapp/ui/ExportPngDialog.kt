@@ -348,7 +348,7 @@ fun ExportPngDialog(
                         { f ->
                             val v = (f * 100f).roundToInt().coerceIn(0, 100)
                             if (v != ExportHub.wmAlpha) ExportHub.wmAlpha = v
-                        }, gestureKey = ExportHub.wmAlpha) {
+                        }, gestureKey = "wmAlpha") {
                         drawRect(Color(0xFF30363D))
                         drawRect(Brush.horizontalGradient(listOf(Color.Transparent, Ep.Accent)))
                     }
@@ -357,7 +357,7 @@ fun ExportPngDialog(
                         { f ->
                             val v = (8f + f * 88f).roundToInt().coerceIn(8, 96)
                             if (v != ExportHub.wmSize) ExportHub.wmSize = v
-                        }, gestureKey = ExportHub.wmSize) {
+                        }, gestureKey = "wmSize") {
                         drawRect(Color(0xFF30363D))
                         drawRect(Brush.horizontalGradient(
                             listOf(Ep.Accent.copy(alpha = 0.35f), Ep.Accent)))
@@ -367,7 +367,7 @@ fun ExportPngDialog(
                         { f ->
                             val v = (20f + f * 280f).roundToInt().coerceIn(20, 300)
                             if (v != ExportHub.wmDensity) ExportHub.wmDensity = v
-                        }, gestureKey = ExportHub.wmDensity) {
+                        }, gestureKey = "wmDensity") {
                         drawRect(Color(0xFF30363D))
                         drawRect(Brush.horizontalGradient(
                             listOf(Ep.Accent.copy(alpha = 0.25f), Ep.Accent)))

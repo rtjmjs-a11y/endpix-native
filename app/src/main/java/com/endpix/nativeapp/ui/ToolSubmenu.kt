@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -172,37 +173,37 @@ fun PenSubmenu(
             Text("笔刷参数", color = Ep.Sub, fontSize = 9.sp)
             SubSlider("硬度", BrushHub.hardness / 100f, "${BrushHub.hardness}%",
                 { f -> BrushHub.updateParam(1, (f * 100f).roundToInt()) },
-                gestureKey = BrushHub.hardness) {
+                gestureKey = "brushHardness") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Color(0xFF8A93A0), Color.White)))
             }
             SubSlider("间距", (BrushHub.spacing - 1) / 99f, "${BrushHub.spacing}%",
                 { f -> BrushHub.updateParam(2, 1 + (f * 99f).roundToInt()) },
-                gestureKey = BrushHub.spacing) {
+                gestureKey = "brushSpacing") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Ep.Accent, Ep.Accent.copy(alpha = 0.25f))))
             }
             SubSlider("散射", BrushHub.scatter / 100f, "${BrushHub.scatter}%",
                 { f -> BrushHub.updateParam(3, (f * 100f).roundToInt()) },
-                gestureKey = BrushHub.scatter) {
+                gestureKey = "brushScatter") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Ep.Accent.copy(alpha = 0.25f), Ep.Accent)))
             }
             SubSlider("长宽比", (BrushHub.aspect - 5) / 95f, "${BrushHub.aspect}%",
                 { f -> BrushHub.updateParam(4, 5 + (f * 95f).roundToInt()) },
-                gestureKey = BrushHub.aspect) {
+                gestureKey = "brushAspect") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Ep.Accent, Color(0xFF9B7BFF))))
             }
             SubSlider("角度", BrushHub.angle / 359f, "${BrushHub.angle}°",
                 { f -> BrushHub.updateParam(5, (f * 359f).roundToInt()) },
-                gestureKey = BrushHub.angle) {
+                gestureKey = "brushAngle") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Color(0xFF9B7BFF), Ep.Accent)))
             }
             SubSlider("流量", BrushHub.flow / 100f, "${BrushHub.flow}%",
                 { f -> BrushHub.updateParam(6, (f * 100f).roundToInt()) },
-                gestureKey = BrushHub.flow) {
+                gestureKey = "brushFlow") {
                 drawRect(Color(0xFF30363D))
                 drawRect(Brush.horizontalGradient(listOf(Ep.Accent.copy(alpha = 0.2f), Ep.Accent)))
             }
@@ -335,26 +336,69 @@ fun SubSlider(
 ) {
     // 手势 pointerInput(Unit) 会捕获首次组合的 lambda；用 rememberUpdatedState 保证滑杆上限切换后立即生效
     val onChangeLatest = rememberUpdatedState(onChange)
+    val valueLatest = rememberUpdatedState(value)
+    var fineUi by remember { mutableStateOf(false) }
+    // 长按计时: 独立于手势循环(restricted suspend 里不能 withTimeout)，400ms 后置 longReady，
+    // 手势在下一次指针事件(移动/抬起)时进入微调。
+    var pressing by remember { mutableStateOf(false) }
+    var pressToken by remember { mutableStateOf(0) }
+    var longReady by remember { mutableStateOf(false) }
+    LaunchedEffect(pressing, pressToken) {
+        if (!pressing) { longReady = false; return@LaunchedEffect }
+        longReady = false
+        kotlinx.coroutines.delay(400)
+        longReady = true
+    }
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val slopPx = with(androidx.compose.ui.platform.LocalDensity.current) { 10.dp.toPx() }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.height(26.dp)) {
         Text(label, color = Ep.Sub, fontSize = 9.sp, modifier = Modifier.width(28.dp))
         // 触摸区撑满 26dp(视觉轨道仍 14dp): 细轨道更好按; 消费事件防止父级 verticalScroll
-        // 抢走手势, 这样长按后继续滑动也能稳定调值。
+        // 抢走手势。按住 400ms 不动进入"微调": 从当前值开始按 1/5 速度跟手, 不跳值;
+        // 轻点(松手)才按点击位置设值; 快速拖动仍是绝对定位。
         Box(
             Modifier.weight(1f).height(26.dp)
                 .pointerInput(gestureKey) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        pressing = true
+                        longReady = false
+                        pressToken = pressToken + 1
                         fun apply(p: Offset) {
                             onChangeLatest.value((p.x / size.width).coerceIn(0f, 1f))
                         }
-                        down.consume()
-                        apply(down.position)
+                        var fine = false
+                        var moved = false
+                        var lastX = down.position.x
+                        var fineValue = valueLatest.value
                         while (true) {
                             val ev = awaitPointerEvent()
+                            if (!fine && !moved && longReady) {
+                                // 长按未移动: 进入微调, 起点=当前值
+                                fine = true
+                                fineUi = true
+                                fineValue = valueLatest.value
+                                lastX = down.position.x
+                                haptics.performHapticFeedback(
+                                    androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                            }
                             val ch = ev.changes.firstOrNull { it.pressed } ?: break
                             ch.consume()
-                            apply(ch.position)
+                            if (fine) {
+                                val dx = ch.position.x - lastX
+                                lastX = ch.position.x
+                                // 5 个轨道宽 = 整个范围, 比直接拖精细 5 倍
+                                fineValue = (fineValue + dx / (size.width * 5f)).coerceIn(0f, 1f)
+                                onChangeLatest.value(fineValue)
+                            } else {
+                                if (kotlin.math.abs(ch.position.x - down.position.x) > slopPx) moved = true
+                                if (moved) apply(ch.position)
+                            }
                         }
+                        pressing = false
+                        if (!fine && !moved) apply(down.position)   // 轻点: 松手时设值
+                        fineUi = false
                     }
                 },
             contentAlignment = Alignment.Center
@@ -363,12 +407,18 @@ fun SubSlider(
                 androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
                     track()
                     val px = value * size.width
-                    drawRect(Color.White, Offset(px - 1.5f, 0f), Size(3f, size.height),
-                        style = Stroke(1.2.dp.toPx()))
+                    if (fineUi) {
+                        drawRect(Ep.Accent, Offset(px - 2f, 0f), Size(4f, size.height),
+                            style = Stroke(1.4.dp.toPx()))
+                    } else {
+                        drawRect(Color.White, Offset(px - 1.5f, 0f), Size(3f, size.height),
+                            style = Stroke(1.2.dp.toPx()))
+                    }
                 }
             }
         }
-        Text(valueText, color = Ep.Accent, fontSize = 9.sp, textAlign = TextAlign.End,
+        Text(valueText, color = if (fineUi) Color.White else Ep.Accent,
+            fontSize = 9.sp, textAlign = TextAlign.End,
             modifier = Modifier.width(40.dp))
     }
 }
