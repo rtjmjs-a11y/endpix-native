@@ -24,22 +24,81 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
     const raster::Mode25D& g = raster::mode25D();
     const bool d25 = g.on && g.depth > 0 && nl > 1;
-    if (fastCompose && d25) {
-        std::vector<int> vis;
-        vis.reserve(nl);
-        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) vis.push_back(l);
-        const int nv = (int)vis.size();
+    // 固定数组(最多 64 可见层): 每个 tile 构建不再分配 6~10 个 vector;
+    // 超过 64 层(极端工程)回退逐像素合成, 语义不变。
+    int vis[64];
+    int nv = 0;
+    bool overflow = false;
+    for (int l = 0; l < nl; l++) {
+        if (!canvas_->layerVisible(l)) continue;
+        if (nv < 64) vis[nv++] = l;
+        else { overflow = true; break; }
+    }
+    auto fillSlow = [&]() {
+        for (int y = 0; y < TS; y++) {
+            const int cy = y0 + y * stride;
+            uint32_t* drow = buf.get() + (size_t)y * TS;
+            if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+            for (int x = 0; x < TS; x++) {
+                const int cx = x0 + x * stride;
+                drow[x] = (cx < cw)
+                    ? raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false)
+                    : 0;
+            }
+        }
+    };
+    // 快路径的空 tile 快速判断(只对 L0: 每块只查 1~4 个画布 tile, 收益稳定;
+    // 更高级别一块覆盖很多画布 tile, 密集内容时检查反而拖慢, 实测回退)。
+    if (fastCompose && !overflow && level == 0) {
+        bool any = false;
         const int ctx = canvas_->tilesX();
-        std::vector<int> oxs(nv), oys(nv);
+        for (int i = 0; i < nv && !any; i++) {
+            const int l = vis[i];
+            int ox = 0, oy = 0;
+            if (d25) {
+                const int off = l * g.depth;
+                ox = (int)std::lround(g.offX * off);
+                oy = (int)std::lround(g.offY * off);
+            }
+            const int sx0 = x0 - ox, sy0 = y0 - oy;
+            const int sx1 = sx0 + (TS - 1) * stride;
+            const int sy1 = sy0 + (TS - 1) * stride;
+            if (sx1 < 0 || sy1 < 0 || sx0 >= cw || sy0 >= ch) continue;
+            const int txA = std::max(0, sx0) >> Canvas::TILE_SHIFT;
+            const int txB = std::min(cw - 1, sx1) >> Canvas::TILE_SHIFT;
+            const int tyA = std::max(0, sy0) >> Canvas::TILE_SHIFT;
+            const int tyB = std::min(ch - 1, sy1) >> Canvas::TILE_SHIFT;
+            for (int ty2 = tyA; ty2 <= tyB && !any; ty2++) {
+                for (int tx2 = txA; tx2 <= txB; tx2++) {
+                    const int ti = ty2 * ctx + tx2;
+                    if (canvas_->isSolidTile(l, ti) || canvas_->tile(l, ti)) { any = true; break; }
+                }
+            }
+        }
+        if (!any) {
+            memset(buf.get(), 0, (size_t)TS * TS * 4);
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = tiles_.find(k);
+            if (it != tiles_.end()) return it->second.get();
+            uint32_t* p = buf.get();
+            tiles_.emplace(k, std::move(buf));
+            return p;
+        }
+    }
+    if (overflow || !fastCompose) {
+        fillSlow();
+    } else if (d25) {
+        const int ctx = canvas_->tilesX();
+        int oxs[64], oys[64];
         for (int i = 0; i < nv; i++) {
             const int off = vis[i] * g.depth;
             oxs[i] = (int)std::lround(g.offX * off);
             oys[i] = (int)std::lround(g.offY * off);
         }
-        std::vector<const uint32_t*> ptrs(nv);
-        std::vector<uint32_t> scols(nv);
-        std::vector<uint8_t> solids(nv), rowOk(nv);
-        std::vector<int> lastTx(nv), tyi(nv), lyv(nv);
+        const uint32_t* ptrs[64];
+        uint32_t scols[64];
+        uint8_t solids[64], rowOk[64];
+        int lastTx[64], tyi[64], lyv[64];
         for (int y = 0; y < TS; y++) {
             const int cy = y0 + y * stride;
             uint32_t* drow = buf.get() + (size_t)y * TS;
@@ -62,15 +121,15 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
                     if (!rowOk[i]) continue;
                     const int sx = cx - oxs[i];
                     if (sx < 0 || sx >= cw) continue;
-                    const int tx = sx >> Canvas::TILE_SHIFT;
-                    if (tx != lastTx[i]) {
-                        const int ti = tyi[i] * ctx + tx;
+                    const int tx2 = sx >> Canvas::TILE_SHIFT;
+                    if (tx2 != lastTx[i]) {
+                        const int ti = tyi[i] * ctx + tx2;
                         const int l = vis[i];
                         const bool s = canvas_->isSolidTile(l, ti);
                         solids[i] = s ? 1 : 0;
                         scols[i] = s ? canvas_->solidTileColor(l, ti) : 0;
                         ptrs[i] = s ? nullptr : canvas_->tile(l, ti);
-                        lastTx[i] = tx;
+                        lastTx[i] = tx2;
                     }
                     const uint32_t v = solids[i] ? scols[i]
                         : (ptrs[i] ? ptrs[i][((size_t)lyv[i] << Canvas::TILE_SHIFT) +
@@ -80,82 +139,66 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
                 drow[x] = acc;
             }
         }
-    } else if (fastCompose) {
-        std::vector<int> vis;
-        vis.reserve(nl);
-        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) vis.push_back(l);
-        const int nv = (int)vis.size();
+    } else if (nv == 1) {
+        const int l = vis[0];
         const int ctx = canvas_->tilesX();
-        if (nv == 1) {
-            const int l = vis[0];
-            for (int y = 0; y < TS; y++) {
-                const int cy = y0 + y * stride;
-                uint32_t* drow = buf.get() + (size_t)y * TS;
-                if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
-                const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
-                int lastTx = -1;
-                const uint32_t* pt = nullptr;
-                bool solid = false;
-                uint32_t scol = 0;
-                for (int x = 0; x < TS; x++) {
-                    const int cx = x0 + x * stride;
-                    if (cx >= cw) { drow[x] = 0; continue; }
-                    const int tx = cx >> Canvas::TILE_SHIFT;
-                    if (tx != lastTx) {
-                        const int ti = tyi * ctx + tx;
-                        solid = canvas_->isSolidTile(l, ti);
-                        scol = solid ? canvas_->solidTileColor(l, ti) : 0;
-                        pt = solid ? nullptr : canvas_->tile(l, ti);
-                        lastTx = tx;
-                    }
-                    drow[x] = solid ? scol : (pt ? pt[((size_t)ly << Canvas::TILE_SHIFT) +
-                                                   (cx & (Canvas::TILE - 1))] : 0);
-                }
-            }
-        } else {
-            std::vector<const uint32_t*> ptrs(nv);
-            std::vector<uint32_t> scols(nv);
-            std::vector<uint8_t> solids(nv);
-            for (int y = 0; y < TS; y++) {
-                const int cy = y0 + y * stride;
-                uint32_t* drow = buf.get() + (size_t)y * TS;
-                if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
-                const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
-                int lastTx = -1;
-                for (int x = 0; x < TS; x++) {
-                    const int cx = x0 + x * stride;
-                    if (cx >= cw) { drow[x] = 0; continue; }
-                    const int tx = cx >> Canvas::TILE_SHIFT;
-                    if (tx != lastTx) {
-                        const int ti = tyi * ctx + tx;
-                        for (int i = 0; i < nv; i++) {
-                            const int l = vis[i];
-                            const bool s = canvas_->isSolidTile(l, ti);
-                            solids[i] = s ? 1 : 0;
-                            scols[i] = s ? canvas_->solidTileColor(l, ti) : 0;
-                            ptrs[i] = s ? nullptr : canvas_->tile(l, ti);
-                        }
-                        lastTx = tx;
-                    }
-                    const int off = (ly << Canvas::TILE_SHIFT) + (cx & (Canvas::TILE - 1));
-                    uint32_t acc = 0;
-                    for (int i = 0; i < nv; i++) {
-                        const uint32_t v = solids[i] ? scols[i] : (ptrs[i] ? ptrs[i][off] : 0);
-                        if (v) raster::overPixel(acc, v);
-                    }
-                    drow[x] = acc;
-                }
-            }
-        }
-    } else {
         for (int y = 0; y < TS; y++) {
             const int cy = y0 + y * stride;
             uint32_t* drow = buf.get() + (size_t)y * TS;
             if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+            const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
+            int lastTx = -1;
+            const uint32_t* pt = nullptr;
+            bool solid = false;
+            uint32_t scol = 0;
             for (int x = 0; x < TS; x++) {
                 const int cx = x0 + x * stride;
                 if (cx >= cw) { drow[x] = 0; continue; }
-                drow[x] = raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+                const int tx2 = cx >> Canvas::TILE_SHIFT;
+                if (tx2 != lastTx) {
+                    const int ti = tyi * ctx + tx2;
+                    solid = canvas_->isSolidTile(l, ti);
+                    scol = solid ? canvas_->solidTileColor(l, ti) : 0;
+                    pt = solid ? nullptr : canvas_->tile(l, ti);
+                    lastTx = tx2;
+                }
+                drow[x] = solid ? scol : (pt ? pt[((size_t)ly << Canvas::TILE_SHIFT) +
+                                               (cx & (Canvas::TILE - 1))] : 0);
+            }
+        }
+    } else {
+        const int ctx = canvas_->tilesX();
+        const uint32_t* ptrs[64];
+        uint32_t scols[64];
+        uint8_t solids[64];
+        for (int y = 0; y < TS; y++) {
+            const int cy = y0 + y * stride;
+            uint32_t* drow = buf.get() + (size_t)y * TS;
+            if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+            const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
+            int lastTx = -1;
+            for (int x = 0; x < TS; x++) {
+                const int cx = x0 + x * stride;
+                if (cx >= cw) { drow[x] = 0; continue; }
+                const int tx2 = cx >> Canvas::TILE_SHIFT;
+                if (tx2 != lastTx) {
+                    const int ti = tyi * ctx + tx2;
+                    for (int i = 0; i < nv; i++) {
+                        const int l = vis[i];
+                        const bool s = canvas_->isSolidTile(l, ti);
+                        solids[i] = s ? 1 : 0;
+                        scols[i] = s ? canvas_->solidTileColor(l, ti) : 0;
+                        ptrs[i] = s ? nullptr : canvas_->tile(l, ti);
+                    }
+                    lastTx = tx2;
+                }
+                const int off = (ly << Canvas::TILE_SHIFT) + (cx & (Canvas::TILE - 1));
+                uint32_t acc = 0;
+                for (int i = 0; i < nv; i++) {
+                    const uint32_t v = solids[i] ? scols[i] : (ptrs[i] ? ptrs[i][off] : 0);
+                    if (v) raster::overPixel(acc, v);
+                }
+                drow[x] = acc;
             }
         }
     }
@@ -180,20 +223,29 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
     int singleLayer = -2;
-    std::vector<int> vis;
+    int vis[64];
+    int nv = 0;
+    bool visOverflow = false;
     if (fastCompose) {
         int cnt = 0;
-        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; vis.push_back(l); }
+        for (int l = 0; l < nl; l++) {
+            if (canvas_->layerVisible(l)) {
+                singleLayer = l;
+                cnt++;
+                if (nv < 64) vis[nv++] = l;
+                else visOverflow = true;
+            }
+        }
         if (cnt != 1) singleLayer = -2;
     }
     // 2.5D 时每层有位移, 逐像素现算(与 composeLayersPixelFast 一致); 其余走行级 tile 指针缓存
     const raster::Mode25D& g25 = raster::mode25D();
     const bool d25 = g25.on && g25.depth > 0 && nl > 1;
-    const bool rowFast = fastCompose && !d25 && !vis.empty();
+    const bool rowFast = fastCompose && !d25 && nv > 0 && !visOverflow;
     const int ctx = canvas_->tilesX();
-    std::vector<const uint32_t*> ptrs(vis.size());
-    std::vector<uint32_t> scols(vis.size());
-    std::vector<uint8_t> solids(vis.size());
+    const uint32_t* ptrs[64];
+    uint32_t scols[64];
+    uint8_t solids[64];
     for (int level = 0; level < 6; level++) {
         const bool recompute = (visibleLevel < 0 || visibleLevel == level);
         const int span = TS << level;
@@ -217,7 +269,6 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                 if (rowFast) {
                     // 每行缓存各层 tile 指针/纯色, 避免逐像素 getPixelL 的查表;
                     // 与 MipPyramid::tile 的快路径同语义(正常混合/不透明度100%)
-                    const int nv = (int)vis.size();
                     for (int ly = ly0; ly <= ly1; ly++) {
                         const int cy = by + (ly << level);
                         uint32_t* trow = t + (size_t)ly * TS;
