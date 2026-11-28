@@ -21,9 +21,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
 
 // 动效语言参考 guanmo-ai/ui-moments:
 //  --ease: cubic-bezier(.16,1,.3,1)   --spring: cubic-bezier(.3,1.45,.5,1)
@@ -61,32 +64,75 @@ fun Modifier.pressScale(
     return graphicsLayer { scaleX = s; scaleY = s; alpha = a }
 }
 
-// 浮层/菜单入场: fade + 0.96→1 + 轻微位移; 关闭时缩小淡出。
-// side: -1 左侧滑入, 1 右侧滑入, 0 上下滑入
+// 浮层/菜单入场: 只做 graphicsLayer 变换(alpha/scale/位移), 不参与布局, 避免每帧 relayout。
+// side: -1 左侧滑入(从左边缘长出), 1 右侧, 0 上下(默认从下往上)。
+// 首次显示先等一帧让内容完成组合, 再启动弹簧, 避免"组合卡顿+动画"叠在同一帧。
 @Composable
 fun MotionPanel(
     visible: Boolean,
     modifier: Modifier = Modifier,
     side: Int = 0,
-    origin: TransformOrigin = TransformOrigin(0.5f, 0.5f),
+    origin: TransformOrigin = when {
+        side < 0 -> TransformOrigin(0f, 0.5f)
+        side > 0 -> TransformOrigin(1f, 0.5f)
+        else -> TransformOrigin(0.5f, 0.5f)
+    },
     content: @Composable () -> Unit,
 ) {
-    val slide = when (side) {
-        -1 -> slideInHorizontally(animationSpec = Motion.SlideIn) { -it / 12 }
-        1 -> slideInHorizontally(animationSpec = Motion.SlideIn) { it / 12 }
-        else -> slideInVertically(animationSpec = Motion.SlideIn) { it / 14 }
+    val progress = remember { androidx.compose.animation.core.Animatable(0f) }
+    var shown by remember { mutableStateOf(false) }
+    val distPx = with(androidx.compose.ui.platform.LocalDensity.current) { 26.dp.toPx() }
+    LaunchedEffect(visible) {
+        if (visible) {
+            shown = true
+            withFrameNanos { }
+            progress.animateTo(
+                1f,
+                androidx.compose.animation.core.spring(
+                    dampingRatio = 0.72f, stiffness = 680f)
+            )
+        } else if (shown) {
+            progress.animateTo(
+                0f,
+                androidx.compose.animation.core.tween(
+                    durationMillis = 150,
+                    easing = androidx.compose.animation.core.CubicBezierEasing(0.4f, 0f, 1f, 1f))
+            )
+            shown = false
+        }
     }
-    val state = remember { MutableTransitionState(false) }
-    LaunchedEffect(visible) { state.targetState = visible }
-    AnimatedVisibility(
-        visibleState = state,
-        modifier = modifier,
-        enter = fadeIn(Motion.PanelIn) +
-            scaleIn(initialScale = 0.96f, animationSpec = Motion.PanelIn, transformOrigin = origin) +
-            slide,
-        exit = fadeOut(Motion.PanelOut) +
-            scaleOut(targetScale = 0.98f, animationSpec = Motion.PanelOut, transformOrigin = origin),
-    ) { content() }
+    if (shown) {
+        val dir = when (side) { -1 -> -1f; 1 -> 1f; else -> 0f }
+        androidx.compose.foundation.layout.Box(
+            modifier
+                .then(
+                    if (!visible) Modifier.pointerInput(Unit) {
+                        // 退场动画期间吞掉触摸, 防止点到正在淡出的菜单项
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                    .changes.forEach { it.consume() }
+                            }
+                        }
+                    } else Modifier
+                )
+                .graphicsLayer {
+                    val p = progress.value
+                    alpha = p.coerceIn(0f, 1f)
+                    val sc = 0.92f + 0.08f * p
+                    scaleX = sc
+                    scaleY = sc
+                    if (dir != 0f) {
+                        translationX = (1f - p) * dir * distPx
+                        translationY = 0f
+                    } else {
+                        translationX = 0f
+                        translationY = (1f - p) * distPx
+                    }
+                    transformOrigin = origin
+                }
+        ) { content() }
+    }
 }
 
 // 对话框卡片入场(窗口本身没有退出动画): 0.975→1 + fade

@@ -12,8 +12,8 @@ android {
         applicationId 'com.endpix.nativeapp'
         minSdk 26
         targetSdk 36
-        versionCode 167
-        versionName 'pn167'
+        versionCode 168
+        versionName 'pn168'
         externalNativeBuild { cmake { cppFlags '-std=c++20 -O3 -funroll-loops -march=armv8.2-a+dotprod' } }
         ndk { abiFilters 'arm64-v8a' }
     }
@@ -28,6 +28,8 @@ android {
     }
     buildTypes {
         release {
+            // 用本机 debug keystore 签名: 与现有安装同证书, 可直接覆盖升级; 同时享受 R8 优化
+            signingConfig signingConfigs.debug
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
