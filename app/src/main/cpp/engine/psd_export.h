@@ -7,6 +7,7 @@ namespace endpix {
 struct PsdResult {
     bool ok = false;
     long long bytes = 0;
+    long ms = 0;
     std::string err;
 };
 

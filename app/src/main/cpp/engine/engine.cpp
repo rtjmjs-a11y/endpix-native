@@ -2,6 +2,7 @@
 #include "png_export.h"
 #include "psd_export.h"
 #include "gif_writer.h"
+#include "parallel.h"
 #include "../raster/raster.h"
 #include <android/log.h>
 #include <chrono>
@@ -525,12 +526,20 @@ void Engine::requestLoadSnapshot(std::string path) {
 }
 
 // 渲染线程: 序列化 -> 后台线程写临时文件再改名
+// wait=false 的自动保存切成 ~2MB/帧 的作业: 不再一次性复制整个画布卡住渲染线程;
+// 期间只要有新编辑(rev 变化)就放弃本次, 下次空闲重新来, 保证像素/撤销栈一致。
 void Engine::saveSnapshotNow(const std::string& path, bool wait) {
+    if (wait) {
+        snapJob_.reset();   // 同步保存(切标签/暂停)优先, 丢掉半成品异步作业
+    } else if (snapJob_) {
+        if (snapJob_->path == path) return;   // 同一标签已在后台打包
+        snapJob_.reset();                      // 换标签了, 旧作业作废
+    }
     // 已确认但还没搬完的落定先实体化; 未确认的裁剪浮层保持原样一起存进 v3
     sel_.prepareForSnapshot();
     // 后台打断在笔画中途时可能留下未收尾的记录: 落盘前丢弃, 避免恢复后和新笔画合并成多出来的一步
     discardOpenStrokeRecord();
-    LOGI("snapshot save undo=%zu redo=%zu", undo_.size(), redo_.size());
+    LOGI("snapshot save undo=%zu redo=%zu async=%d", undo_.size(), redo_.size(), wait ? 0 : 1);
     const uint64_t rev = canvas_.revision();
     // onPause 和 onStop 会连着触发: 内容没变就不重复序列化(40MB 原始数据复制+压缩不便宜)
     if (rev == lastSavedRev_.load() && frameRev_.load() == lastSavedFrameRev_ &&
@@ -542,8 +551,7 @@ void Engine::saveSnapshotNow(const std::string& path, bool wait) {
     }
     // 当前帧先落进帧数组, 保证快照里的帧内容是最新的
     if (frame_ >= 0 && frame_ < (int)frameData_.size()) storeFrameData();
-    const int lc = canvas_.layers();
-    int count = canvas_.liveTileCount();
+    const int count = canvas_.liveTileCount();
     if (path.empty() || count > 8192) {
         LOGI("snapshot skip: tiles=%d path=%s", count, path.c_str());
         std::lock_guard<std::mutex> lk(snapMu_);
@@ -551,82 +559,135 @@ void Engine::saveSnapshotNow(const std::string& path, bool wait) {
         snapCv_.notify_all();
         return;
     }
-    std::vector<uint8_t> buf;
-    buf.reserve((size_t)32 + (size_t)count * (Canvas::TILE_PIX * 4 + 16));
+    auto j = std::make_unique<SnapJob>();
+    j->path = path;
+    j->wait = wait;
+    j->lc = canvas_.layers();
+    j->count = count;
+    j->buf.reserve((size_t)32 + (size_t)count * (Canvas::TILE_PIX * 4 + 16));
+    j->rev = canvas_.revision();
+    j->frameRev = frameRev_.load();
+    j->selRev = selStateRev_;
+    j->layerRev = layerMetaRev_;
+    if (wait) {
+        while (!snapshotStep(*j, (size_t)-1)) {}
+        snapshotComplete(*j);
+    } else {
+        snapJob_ = std::move(j);
+        tickSnapshot();   // 立刻推进第一片
+    }
+}
+
+// 序列化一片; budgetBytes=本帧最多追加的字节数
+bool Engine::snapshotStep(SnapJob& j, size_t budgetBytes) {
+    auto& buf = j.buf;
     auto put32 = [&](uint32_t v) {
         buf.push_back((uint8_t)(v & 255)); buf.push_back((uint8_t)((v >> 8) & 255));
         buf.push_back((uint8_t)((v >> 16) & 255)); buf.push_back((uint8_t)((v >> 24) & 255));
     };
-    put32(0x534E5058u);   // 'X P N S'
-    put32(8u);   // v8: 撤销记录带类型/所属帧, 支持图层元数据记录; v6/v7 见下
-    put32((uint32_t)canvas_.width()); put32((uint32_t)canvas_.height());
-    put32((uint32_t)lc); put32((uint32_t)canvas_.active());
-    put32((uint32_t)count);
-    for (int l = 0; l < lc; l++) {
-        for (int ti = 0; ti < canvas_.tilesX() * canvas_.tilesY(); ti++) {
-            const bool solid = canvas_.isSolidTile(l, ti);
-            const uint32_t* px = canvas_.tile(l, ti);
-            if (!solid && !px) continue;
-            put32((uint32_t)l); put32((uint32_t)ti);
-            if (solid) {
-                put32(1u); put32(canvas_.solidTileColor(l, ti));
-            } else {
-                put32(0u);
-                const size_t off = buf.size();
-                buf.resize(off + Canvas::TILE_PIX * 4);
-                memcpy(buf.data() + off, px, Canvas::TILE_PIX * 4);
+    const size_t mark = buf.size();
+    auto overBudget = [&]() { return buf.size() - mark >= budgetBytes; };
+    for (;;) {
+        switch (j.phase) {
+        case SnapJob::START:
+            put32(0x534E5058u);   // 'X P N S'
+            put32(8u);   // v8: 撤销记录带类型/所属帧, 支持图层元数据记录
+            put32((uint32_t)canvas_.width()); put32((uint32_t)canvas_.height());
+            put32((uint32_t)j.lc); put32((uint32_t)canvas_.active());
+            put32((uint32_t)j.count);
+            j.phase = SnapJob::TILES;
+            break;
+        case SnapJob::TILES: {
+            const int total = canvas_.tilesX() * canvas_.tilesY();
+            while (j.l < j.lc) {
+                while (j.ti < total) {
+                    const int l = j.l, ti = j.ti;
+                    const bool solid = canvas_.isSolidTile(l, ti);
+                    const uint32_t* px = canvas_.tile(l, ti);
+                    if (solid || px) {
+                        put32((uint32_t)l); put32((uint32_t)ti);
+                        if (solid) {
+                            put32(1u); put32(canvas_.solidTileColor(l, ti));
+                        } else {
+                            put32(0u);
+                            const size_t off = buf.size();
+                            buf.resize(off + Canvas::TILE_PIX * 4);
+                            memcpy(buf.data() + off, px, Canvas::TILE_PIX * 4);
+                        }
+                    }
+                    j.ti++;
+                    if (overBudget()) return false;
+                }
+                j.l++; j.ti = 0;
             }
+            // v2: 图层可见/锁定 + 全部帧 + 播放设置 + 上次裁剪
+            unsigned visBits = 0, lckBits = 0;
+            for (int l = 0; l < j.lc && l < 32; l++) {
+                if (canvas_.layerVisible(l)) visBits |= 1u << l;
+                if (canvas_.isLayerLocked(l)) lckBits |= 1u << l;
+            }
+            put32(visBits); put32(lckBits);
+            put32((uint32_t)frameData_.size());
+            put32((uint32_t)frame_);
+            put32((uint32_t)playFps_.load());
+            put32((uint32_t)loopStart_.load());
+            put32((uint32_t)loopEnd_.load());
+            j.frameIdx = 0;
+            j.phase = SnapJob::FRAMES;
+            break;
         }
-    }
-    // v2: 图层可见/锁定 + 全部帧 + 播放设置 + 上次裁剪
-    {
-        unsigned visBits = 0, lckBits = 0;
-        for (int l = 0; l < lc && l < 32; l++) {
-            if (canvas_.layerVisible(l)) visBits |= 1u << l;
-            if (canvas_.isLayerLocked(l)) lckBits |= 1u << l;
+        case SnapJob::FRAMES: {
+            while (j.frameIdx < frameData_.size()) {
+                const auto& fd = frameData_[j.frameIdx];
+                put32((uint32_t)fd.size());
+                buf.insert(buf.end(), fd.begin(), fd.end());
+                j.frameIdx++;
+                if (overBudget()) return false;
+            }
+            const bool lcOk = sel_.lastW() > 0 && sel_.lastH() > 0 &&
+                              (long long)sel_.lastW() * sel_.lastH() <= 4ll * 1024 * 1024 &&
+                              sel_.lastCutPixels().size() >= (size_t)sel_.lastW() * sel_.lastH();
+            put32(lcOk ? (uint32_t)sel_.lastW() : 0u);
+            put32(lcOk ? (uint32_t)sel_.lastH() : 0u);
+            if (lcOk) {
+                const size_t off = buf.size();
+                buf.resize(off + (size_t)sel_.lastW() * sel_.lastH() * 4);
+                memcpy(buf.data() + off, sel_.lastCutPixels().data(), (size_t)sel_.lastW() * sel_.lastH() * 4);
+            }
+            j.phase = SnapJob::SELSTATE;
+            break;
         }
-        put32(visBits); put32(lckBits);
-        put32((uint32_t)frameData_.size());
-        put32((uint32_t)frame_);
-        put32((uint32_t)playFps_.load());
-        put32((uint32_t)loopStart_.load());
-        put32((uint32_t)loopEnd_.load());
-        for (const auto& fd : frameData_) {
-            put32((uint32_t)fd.size());
-            buf.insert(buf.end(), fd.begin(), fd.end());
-        }
-        const bool lcOk = sel_.lastW() > 0 && sel_.lastH() > 0 &&
-                          (long long)sel_.lastW() * sel_.lastH() <= 4ll * 1024 * 1024 &&
-                          sel_.lastCutPixels().size() >= (size_t)sel_.lastW() * sel_.lastH();
-        put32(lcOk ? (uint32_t)sel_.lastW() : 0u);
-        put32(lcOk ? (uint32_t)sel_.lastH() : 0u);
-        if (lcOk) {
-            const size_t off = buf.size();
-            buf.resize(off + (size_t)sel_.lastW() * sel_.lastH() * 4);
-            memcpy(buf.data() + off, sel_.lastCutPixels().data(), (size_t)sel_.lastW() * sel_.lastH() * 4);
-        }
-    }
-    // v3: 未落定的选区/裁剪浮层/拉伸旋转状态
-    sel_.saveState(buf);
-    // v4: 图层名称/不透明度
-    put32((uint32_t)lc);
-    for (int l = 0; l < lc; l++) {
-        const std::string& nm = canvas_.layerName(l);
-        put32((uint32_t)nm.size());
-        buf.insert(buf.end(), nm.begin(), nm.end());
-        put32((uint32_t)std::lround(canvas_.layerOpacity(l) * 1000.f));
-    }
-    // v5: 撤销/重做栈(后台返回/导出的项目再打开还能继续撤销); 总量上限 24MB
-    // v8: 每条记录带 kind/frame; 文档快照(doc)不入快照(帧数据整份复制太大), 有 doc 时不持久化历史
-    {
-        bool hasDoc = false;
-        for (const auto& h : undo_) if (h.doc) hasDoc = true;
-        for (const auto& h : redo_) if (h.doc) hasDoc = true;
-        const bool histOk = !hasDoc && (undoBytes_ + redoBytes_) <= 24u * 1024 * 1024;
-        auto putHist = [&](const std::vector<Hist>& hist) {
-            put32(histOk ? (uint32_t)hist.size() : 0u);
-            if (!histOk) return;
-            for (const auto& h : hist) {
+        case SnapJob::SELSTATE:
+            // v3: 未落定的选区/裁剪浮层/拉伸旋转状态
+            sel_.saveState(buf);
+            j.phase = SnapJob::NAMES;
+            break;
+        case SnapJob::NAMES:
+            // v4: 图层名称/不透明度
+            put32((uint32_t)j.lc);
+            for (int l = 0; l < j.lc; l++) {
+                const std::string& nm = canvas_.layerName(l);
+                put32((uint32_t)nm.size());
+                buf.insert(buf.end(), nm.begin(), nm.end());
+                put32((uint32_t)std::lround(canvas_.layerOpacity(l) * 1000.f));
+            }
+            // v5: 撤销/重做栈(后台返回/导出的项目再打开还能继续撤销); 总量上限 24MB
+            // v8: 每条记录带 kind/frame; 有 doc 时不持久化历史
+            {
+                bool hasDoc = false;
+                for (const auto& h : undo_) if (h.doc) hasDoc = true;
+                for (const auto& h : redo_) if (h.doc) hasDoc = true;
+                j.histOk = !hasDoc && (undoBytes_ + redoBytes_) <= 24u * 1024 * 1024;
+                j.histRedo = false;
+                j.histIdx = 0;
+                put32(j.histOk ? (uint32_t)undo_.size() : 0u);
+            }
+            j.phase = SnapJob::HIST;
+            break;
+        case SnapJob::HIST: {
+            const std::vector<Hist>& hist = j.histRedo ? redo_ : undo_;
+            if (j.histOk && j.histIdx < hist.size()) {
+                const Hist& h = hist[j.histIdx];
                 put32((uint32_t)h.kind);
                 put32((uint32_t)h.frame);
                 if (h.kind == 2 && h.meta) {   // 图层元数据记录
@@ -643,66 +704,92 @@ void Engine::saveSnapshotNow(const std::string& path, bool wait) {
                         buf.insert(buf.end(), m.names[l].begin(), m.names[l].end());
                     }
                     put32(m.m25on ? 1u : 0u); put32((uint32_t)m.m25depth); put32((uint32_t)m.m25dir);
-                    continue;
-                }
-                put32(h.isFill ? 1u : 0u);
-                put32(h.cBefore); put32(h.cAfter);
-                put32((uint32_t)h.fillLayer);
-                put32((uint32_t)h.rec.size());
-                for (const auto& t : h.rec) {
-                    put32((uint32_t)t.layer); put32((uint32_t)t.ti);
-                    put32((uint32_t)t.kind); put32(t.color);
-                    if (t.kind == 1 && t.px.size() >= (size_t)Canvas::TILE_PIX) {
-                        const size_t off = buf.size();
-                        buf.resize(off + Canvas::TILE_PIX * 4);
-                        memcpy(buf.data() + off, t.px.data(), Canvas::TILE_PIX * 4);
+                } else {
+                    put32(h.isFill ? 1u : 0u);
+                    put32(h.cBefore); put32(h.cAfter);
+                    put32((uint32_t)h.fillLayer);
+                    put32((uint32_t)h.rec.size());
+                    for (const auto& t : h.rec) {
+                        put32((uint32_t)t.layer); put32((uint32_t)t.ti);
+                        put32((uint32_t)t.kind); put32(t.color);
+                        if (t.kind == 1 && t.px.size() >= (size_t)Canvas::TILE_PIX) {
+                            const size_t off = buf.size();
+                            buf.resize(off + Canvas::TILE_PIX * 4);
+                            memcpy(buf.data() + off, t.px.data(), Canvas::TILE_PIX * 4);
+                        }
+                    }
+                    put32((uint32_t)h.spans.size());
+                    for (const auto& sp : h.spans) {
+                        put32((uint32_t)sp.yy); put32((uint32_t)sp.x0); put32((uint32_t)sp.x1);
                     }
                 }
-                put32((uint32_t)h.spans.size());
-                for (const auto& sp : h.spans) {
-                    put32((uint32_t)sp.yy); put32((uint32_t)sp.x0); put32((uint32_t)sp.x1);
-                }
+                j.histIdx++;
+                if (overBudget()) return false;
+            } else if (!j.histRedo) {
+                j.histRedo = true;
+                j.histIdx = 0;
+                put32(j.histOk ? (uint32_t)redo_.size() : 0u);
+            } else {
+                j.phase = SnapJob::ENDMETA;
             }
-        };
-        putHist(undo_);
-        putHist(redo_);
+            break;
+        }
+        case SnapJob::ENDMETA:
+            // v6: 图层模式/平铺参数(每层9项) + 2.5D 全局状态
+            put32((uint32_t)j.lc);
+            for (int l = 0; l < j.lc; l++) {
+                put32((uint32_t)canvas_.layerMode(l));
+                put32((uint32_t)canvas_.layerTileW(l));
+                put32((uint32_t)canvas_.layerTileH(l));
+                put32((uint32_t)canvas_.layerTileOffX(l));
+                put32((uint32_t)canvas_.layerTileOffY(l));
+                put32(canvas_.layerShowGrid(l) ? 1u : 0u);
+                put32(canvas_.layerGridColor(l));
+                put32(canvas_.layerTileIndep(l) ? 1u : 0u);
+                put32((uint32_t)canvas_.layerTileLockFrame(l));
+            }
+            {
+                const auto& g = raster::mode25D();
+                put32(g.on ? 1u : 0u);
+                put32((uint32_t)g.depth);
+                put32((uint32_t)g.dir);
+            }
+            // v7: 每层混合模式(正片叠底/滤色/叠加/...)
+            put32((uint32_t)j.lc);
+            for (int l = 0; l < j.lc; l++) put32((uint32_t)canvas_.layerBlend(l));
+            j.phase = SnapJob::THUMB;
+            break;
+        case SnapJob::THUMB: {
+            // storeFrameData() 时已经算过当前帧合成缩略图, 直接复用, 不再全画布采样一遍
+            bool got = false;
+            {
+                std::lock_guard<std::mutex> lk(thumbMu_);
+                if (!compositeThumb_.empty()) { j.thumb = compositeThumb_; got = true; }
+            }
+            if (!got) makeCompositeThumb(j.thumb);
+            j.phase = SnapJob::DONE;
+            return true;
+        }
+        case SnapJob::DONE:
+            return true;
+        }
     }
-    // v6: 图层模式/平铺参数(每层9项) + 2.5D 全局状态
-    put32((uint32_t)lc);
-    for (int l = 0; l < lc; l++) {
-        put32((uint32_t)canvas_.layerMode(l));
-        put32((uint32_t)canvas_.layerTileW(l));
-        put32((uint32_t)canvas_.layerTileH(l));
-        put32((uint32_t)canvas_.layerTileOffX(l));
-        put32((uint32_t)canvas_.layerTileOffY(l));
-        put32(canvas_.layerShowGrid(l) ? 1u : 0u);
-        put32(canvas_.layerGridColor(l));
-        put32(canvas_.layerTileIndep(l) ? 1u : 0u);
-        put32((uint32_t)canvas_.layerTileLockFrame(l));
-    }
-    {
-        const auto& g = raster::mode25D();
-        put32(g.on ? 1u : 0u);
-        put32((uint32_t)g.depth);
-        put32((uint32_t)g.dir);
-    }
-    // v7: 每层混合模式(正片叠底/滤色/叠加/...)
-    put32((uint32_t)lc);
-    for (int l = 0; l < lc; l++) put32((uint32_t)canvas_.layerBlend(l));
-    lastSavedRev_.store(rev);
-    lastSavedFrameRev_ = frameRev_.load();
-    lastSavedSelStateRev_ = selStateRev_;
-    lastSavedLayerMetaRev_ = layerMetaRev_;
+}
+
+void Engine::snapshotComplete(SnapJob& j) {
+    lastSavedRev_.store(j.rev);
+    lastSavedFrameRev_ = j.frameRev;
+    lastSavedSelStateRev_ = j.selRev;
+    lastSavedLayerMetaRev_ = j.layerRev;
     std::vector<uint8_t> thumbBytes;
-    {
-        // 标签栏缩略图=当前帧"全部可见层合成"(之前只取第0层, 画面在其它层时缩略图就是全空)
-        std::vector<uint32_t> th;
-        makeCompositeThumb(th);
-        thumbBytes.resize(th.size() * 4);
-        memcpy(thumbBytes.data(), th.data(), thumbBytes.size());
+    if (!j.thumb.empty()) {
+        thumbBytes.resize(j.thumb.size() * 4);
+        memcpy(thumbBytes.data(), j.thumb.data(), thumbBytes.size());
     }
+    const std::string path = j.path;
     const std::string tmp = path + ".tmp";
-    std::thread([this, path, tmp, buf = std::move(buf), thumbBytes = std::move(thumbBytes), wait]() {
+    const bool wait = j.wait;
+    std::thread([this, path, tmp, buf = std::move(j.buf), thumbBytes = std::move(thumbBytes), wait]() {
         // zlib 压缩(画布大面积透明, 通常能压到几百分之一); 失败则写原始数据
         uLongf csz = compressBound((uLong)buf.size());
         std::vector<uint8_t> cbuf((size_t)csz);
@@ -763,6 +850,22 @@ void Engine::saveSnapshotNow(const std::string& path, bool wait) {
             snapCv_.notify_all();
         }
     }).detach();
+}
+
+void Engine::tickSnapshot() {
+    if (!snapJob_) return;
+    SnapJob& j = *snapJob_;
+    // 打包期间又编辑/切帧/改图层: 这一份已经不一致, 直接丢弃; 空闲后会重新请求
+    if (canvas_.revision() != j.rev || frameRev_.load() != j.frameRev ||
+        selStateRev_ != j.selRev || layerMetaRev_ != j.layerRev) {
+        LOGI("snapshot async abort: content changed");
+        snapJob_.reset();
+        return;
+    }
+    if (snapshotStep(j, 2u * 1024 * 1024)) {
+        snapshotComplete(j);
+        snapJob_.reset();
+    }
 }
 
 void Engine::loadSnapshotNow(const std::string& path) {
@@ -1173,12 +1276,12 @@ void Engine::makeThumb(int frame, int layer, std::vector<uint32_t>& out) {
         const int sy0 = (int)((long long)ty * h / THUMB);
         int sy1 = (int)((long long)(ty + 1) * h / THUMB);
         if (sy1 <= sy0) sy1 = sy0 + 1;
-        const int syStep = std::max(1, (sy1 - sy0) / 6);
+        const int syStep = std::max(1, (sy1 - sy0 + 5) / 6);
         for (int tx = 0; tx < THUMB; tx++) {
             const int sx0 = (int)((long long)tx * w / THUMB);
             int sx1 = (int)((long long)(tx + 1) * w / THUMB);
             if (sx1 <= sx0) sx1 = sx0 + 1;
-            const int sxStep = std::max(1, (sx1 - sx0) / 6);
+            const int sxStep = std::max(1, (sx1 - sx0 + 5) / 6);
             // 时间轴矩阵缩略图: 只取指定图层(旧 BuildTlThumb984 的层缩略图语义)
             uint32_t best = 0;
             int bestA = 0;
@@ -1211,12 +1314,12 @@ void Engine::makeCompositeThumbN(int n, std::vector<uint32_t>& out) {
         const int sy0 = (int)((long long)ty * h / n);
         int sy1 = (int)((long long)(ty + 1) * h / n);
         if (sy1 <= sy0) sy1 = sy0 + 1;
-        const int syStep = std::max(1, (sy1 - sy0) / 8);
+        const int syStep = std::max(1, (sy1 - sy0 + 7) / 8);
         for (int tx = 0; tx < n; tx++) {
             const int sx0 = (int)((long long)tx * w / n);
             int sx1 = (int)((long long)(tx + 1) * w / n);
             if (sx1 <= sx0) sx1 = sx0 + 1;
-            const int sxStep = std::max(1, (sx1 - sx0) / 8);
+            const int sxStep = std::max(1, (sx1 - sx0 + 7) / 8);
             double sa = 0, sr = 0, sg = 0, sb = 0;
             int cnt = 0;
             for (int yy = sy0; yy < sy1; yy += syStep) {
@@ -1256,12 +1359,12 @@ void Engine::makeThumbFromBlob(const std::vector<uint8_t>& blob, std::vector<uin
         const int sy0 = (int)((long long)ty * h / THUMB);
         int sy1 = (int)((long long)(ty + 1) * h / THUMB);
         if (sy1 <= sy0) sy1 = sy0 + 1;
-        const int syStep = std::max(1, (sy1 - sy0) / 6);
+        const int syStep = std::max(1, (sy1 - sy0 + 5) / 6);
         for (int tx = 0; tx < THUMB; tx++) {
             const int sx0 = (int)((long long)tx * w / THUMB);
             int sx1 = (int)((long long)(tx + 1) * w / THUMB);
             if (sx1 <= sx0) sx1 = sx0 + 1;
-            const int sxStep = std::max(1, (sx1 - sx0) / 6);
+            const int sxStep = std::max(1, (sx1 - sx0 + 5) / 6);
             uint32_t best = 0;
             int bestA = 0;
             for (int yy = sy0; yy < sy1; yy += syStep)
@@ -1322,12 +1425,12 @@ void Engine::refreshMinimapThumb() {
             const int sy0 = (int)((long long)ty * h / MMTHUMB);
             int sy1 = (int)((long long)(ty + 1) * h / MMTHUMB);
             if (sy1 <= sy0) sy1 = sy0 + 1;
-            const int syStep = std::max(1, (sy1 - sy0) / 4);
+            const int syStep = std::max(1, (sy1 - sy0 + 3) / 4);
             for (int tx = 0; tx < MMTHUMB; tx++) {
                 const int sx0 = (int)((long long)tx * w / MMTHUMB);
                 int sx1 = (int)((long long)(tx + 1) * w / MMTHUMB);
                 if (sx1 <= sx0) sx1 = sx0 + 1;
-                const int sxStep = std::max(1, (sx1 - sx0) / 4);
+                const int sxStep = std::max(1, (sx1 - sx0 + 3) / 4);
                 uint32_t best = 0;
                 int bestA = 0;
                 for (int yy = sy0; yy < sy1; yy += syStep) {
@@ -1414,12 +1517,12 @@ bool Engine::layerThumb(int frame, int layer, uint32_t* out, int n) {
         const int sy0 = (int)((long long)ty * h / THUMB);
         int sy1 = (int)((long long)(ty + 1) * h / THUMB);
         if (sy1 <= sy0) sy1 = sy0 + 1;
-        const int syStep = std::max(1, (sy1 - sy0) / 6);
+        const int syStep = std::max(1, (sy1 - sy0 + 5) / 6);
         for (int tx = 0; tx < THUMB; tx++) {
             const int sx0 = (int)((long long)tx * w / THUMB);
             int sx1 = (int)((long long)(tx + 1) * w / THUMB);
             if (sx1 <= sx0) sx1 = sx0 + 1;
-            const int sxStep = std::max(1, (sx1 - sx0) / 6);
+            const int sxStep = std::max(1, (sx1 - sx0 + 5) / 6);
             uint32_t best = 0;
             int bestA = 0;
             for (int yy = sy0; yy < sy1; yy += syStep) {
@@ -2224,6 +2327,32 @@ void Engine::runDebugScript() {
             mip_.reset(&canvas_);
             screenFull_ = true;
             logline("mipreset");
+        } else if (cmd == "updateverify") {
+            // 校验 MipPyramid::updateRect 行级缓存路径: 改一块后逐像素对比原合成
+            Canvas tc;
+            tc.create(512, 512, 3);
+            for (int l = 0; l < 3; l++) {
+                tc.setActive(l);
+                raster::stampCircle(tc, 100 + l * 60, 120 + l * 40, 36, 0x80FF0000u | ((uint32_t)l * 0x0000FF00u));
+            }
+            MipPyramid tm;
+            tm.reset(&tc);
+            for (int ty = 0; ty < 2; ty++)
+                for (int tx = 0; tx < 2; tx++) tm.tile(0, tx, ty);
+            raster::stampCircle(tc, 200, 200, 27, 0xFF00FF00u);
+            raster::fillRect(tc, 130, 260, 90, 70, 0xD93366FFu);
+            tm.updateRect(120, 130, 280, 340, 0);
+            int bad = 0, checked = 0;
+            for (int y = 0; y < 512; y++) {
+                for (int x = 0; x < 512; x++) {
+                    const uint32_t want = raster::composeLayersPixelEx(tc, x, y, true, true, false);
+                    const uint32_t* t = tm.tile(0, x >> 8, y >> 8);
+                    const uint32_t got = t ? t[((size_t)(y & 255) << 8) + (x & 255)] : 0;
+                    checked++;
+                    if (got != want) bad++;
+                }
+            }
+            logline("updateverify checked=" + std::to_string(checked) + " bad=" + std::to_string(bad));
         } else if (cmd == "fastcompose") {
             std::string v; ls >> v;
             const bool on = !(v == "0" || v == "off" || v == "false");
@@ -2967,7 +3096,7 @@ void Engine::runDebugScript() {
         } else if (cmd == "exportpsd") {
             std::string p2; ls >> p2;
             PsdResult r = exportPsd(canvas_, p2);
-            if (r.ok) logline("exportpsd ok bytes=" + std::to_string(r.bytes));
+            if (r.ok) logline("exportpsd ok bytes=" + std::to_string(r.bytes) + " ms=" + std::to_string(r.ms));
             else logline("exportpsd err " + r.err);
         } else if (cmd == "export") {
             std::string p2; int sc = 1; ls >> p2 >> sc;
@@ -4675,6 +4804,8 @@ void Engine::loop() {
             }
         }
         serviceExport();
+        // 自动保存快照分帧打包(每帧 ~2MB); 有编辑会自动中止, 不阻塞渲染/输入
+        tickSnapshot();
         // 增量 PNG 导出: 每帧最多 6ms, 大画布导出期间画面/输入保持响应
         {
             std::unique_ptr<PngExporter> job;
@@ -5635,7 +5766,14 @@ void Engine::composeFrameCell(int f, int scale, std::vector<uint32_t>& cell, int
 }
 
 // 多帧/多模式导出(在渲染线程执行; 大尺寸有像素上限, 超限直接报错避免 OOM)
+// 帧/图层互相独立的部分用 parallelFor 并行(最多 4 线程), 导出期间界面依旧会被渲染线程阻塞,
+// 但同样的工作用 4 核完成, 大画布/多帧导出的卡顿时间明显缩短。
 std::string Engine::doMultiExport(const std::string& path, int kind, int scale, int cols, int delayMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto elapsedMs = [&]() {
+        return (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
     const int cw = canvas_.width(), ch = canvas_.height();
     if (cw <= 0 || ch <= 0) return "err empty canvas";
     scale = std::max(1, std::min(10, scale));
@@ -5646,7 +5784,10 @@ std::string Engine::doMultiExport(const std::string& path, int kind, int scale, 
     const int frames = hi - lo + 1;
     if (frames <= 0) return "err no frames";
     const int compress = pngCompress_.load();
-    char msg[192];
+    // 每个并行任务一份 cell 内存; 大画布降低并行度, 防止 4 份 cell 把内存打爆
+    const long long cellPx = (long long)cellW * cellH;
+    const int compThreads = (int)std::max(1ll, std::min(4ll, (96ll * 1024 * 1024) / std::max(1ll, cellPx * 4)));
+    char msg[224];
     if (kind == 2) {   // 精灵图
         const int c = std::max(1, std::min(10, cols));
         const int rows = (frames + c - 1) / c;
@@ -5654,9 +5795,10 @@ std::string Engine::doMultiExport(const std::string& path, int kind, int scale, 
         if (sw <= 0 || sh <= 0 || sw > 65535 || sh > 65535 || sw * sh > 64ll * 1024 * 1024)
             return "err sheet too large";
         std::vector<uint32_t> sheet((size_t)(sw * sh), 0u);
-        std::vector<uint32_t> cell;
-        int cw2 = 0, ch2 = 0;
-        for (int fi = 0; fi < frames; fi++) {
+        // 每帧写互不重叠的矩形区域, 可并行
+        parallelFor(frames, [&](int fi) {
+            std::vector<uint32_t> cell;
+            int cw2 = 0, ch2 = 0;
             composeFrameCell(lo + fi, scale, cell, cw2, ch2);
             const int baseX = (fi % c) * cellW;
             const int baseY = (fi / c) * cellH;
@@ -5665,40 +5807,66 @@ std::string Engine::doMultiExport(const std::string& path, int kind, int scale, 
                 uint32_t* drow = sheet.data() + (size_t)(baseY + y) * sw + baseX;
                 memcpy(drow, srow, (size_t)cellW * 4);
             }
-        }
+        }, compThreads);
         ExportResult r = writePngPixels(sheet.data(), (int)sw, (int)sh, path, compress);
         if (!r.ok) return "err " + r.err;
-        snprintf(msg, sizeof msg, "ok %lldx%lld frames=%d bytes=%lld", sw, sh, frames, r.bytes);
+        snprintf(msg, sizeof msg, "ok %lldx%lld frames=%d bytes=%lld ms=%ld",
+                 sw, sh, frames, r.bytes, elapsedMs());
         return msg;
     }
     if (kind == 3) {   // 逐帧 PNG 写进目录
-        std::vector<uint32_t> cell;
-        int cw2 = 0, ch2 = 0;
-        for (int fi = 0; fi < frames; fi++) {
+        std::mutex emu;
+        std::string firstErr;
+        std::atomic<bool> failed{false};
+        parallelFor(frames, [&](int fi) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            std::vector<uint32_t> cell;
+            int cw2 = 0, ch2 = 0;
             composeFrameCell(lo + fi, scale, cell, cw2, ch2);
             char fn[64];
             snprintf(fn, sizeof fn, "/frame_%04d.png", fi + 1);
             ExportResult r = writePngPixels(cell.data(), cellW, cellH, path + fn, compress);
-            if (!r.ok) return std::string("err frame ") + std::to_string(fi + 1) + ": " + r.err;
-        }
-        snprintf(msg, sizeof msg, "ok %d frames %dx%d", frames, cellW, cellH);
+            if (!r.ok) {
+                std::lock_guard<std::mutex> lk(emu);
+                if (firstErr.empty())
+                    firstErr = "frame " + std::to_string(fi + 1) + ": " + r.err;
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }, compThreads);
+        if (failed.load()) return "err " + firstErr;
+        snprintf(msg, sizeof msg, "ok %d frames %dx%d ms=%ld", frames, cellW, cellH, elapsedMs());
         return msg;
     }
     if (kind == 4) {   // GIF 动画
         GifWriter gif;
         if (!gif.begin(path, cellW, cellH, std::max(2, delayMs / 10))) return "err gif open";
-        std::vector<uint32_t> cell;
-        int cw2 = 0, ch2 = 0;
-        for (int fi = 0; fi < frames; fi++) {
-            composeFrameCell(lo + fi, scale, cell, cw2, ch2);
-            if (!gif.addFrame(cell.data(), cellW, cellH)) return "err gif frame";
+        // 帧总数不大时先并行合成好全部帧, 再顺序 LZW 写文件(按内存上限决定)
+        const long long totalPx = (long long)frames * cellW * cellH;
+        if (totalPx * 4 <= 96ll * 1024 * 1024) {
+            std::vector<std::vector<uint32_t>> cells((size_t)frames);
+            parallelFor(frames, [&](int fi) {
+                int cw2 = 0, ch2 = 0;
+                composeFrameCell(lo + fi, scale, cells[(size_t)fi], cw2, ch2);
+            }, compThreads);
+            for (int fi = 0; fi < frames; fi++) {
+                if (!gif.addFrame(cells[(size_t)fi].data(), cellW, cellH)) return "err gif frame";
+                cells[(size_t)fi].clear();
+                cells[(size_t)fi].shrink_to_fit();
+            }
+        } else {
+            std::vector<uint32_t> cell;
+            int cw2 = 0, ch2 = 0;
+            for (int fi = 0; fi < frames; fi++) {
+                composeFrameCell(lo + fi, scale, cell, cw2, ch2);
+                if (!gif.addFrame(cell.data(), cellW, cellH)) return "err gif frame";
+            }
         }
         if (!gif.finish()) return "err gif write";
         FILE* f = fopen(path.c_str(), "rb");
         long long bytes = 0;
         if (f) { fseek(f, 0, SEEK_END); bytes = ftell(f); fclose(f); }
-        snprintf(msg, sizeof msg, "ok %dx%d frames=%d delay=%dms bytes=%lld",
-                 cellW, cellH, frames, std::max(20, delayMs), bytes);
+        snprintf(msg, sizeof msg, "ok %dx%d frames=%d delay=%dms bytes=%lld ms=%ld",
+                 cellW, cellH, frames, std::max(20, delayMs), bytes, elapsedMs());
         return msg;
     }
     if (kind == 5) {   // 叠层图像: 左右=图层, 上下=帧(第1帧在顶), 背景 #141414; 2.5D开时按显示偏移
@@ -5710,11 +5878,12 @@ std::string Engine::doMultiExport(const std::string& path, int kind, int scale, 
         if (sw <= 0 || sh <= 0 || sw > 65535 || sh > 65535 || sw * sh > 64ll * 1024 * 1024)
             return "err overlay too large";
         std::vector<uint32_t> sheet((size_t)(sw * sh), 0xFF141414u);
-        Canvas tmp;
-        for (int fi = 0; fi < frames; fi++) {
+        // 每帧写自己的横向条带(上下不重叠), 每线程自己的临时 Canvas
+        parallelFor(frames, [&](int fi) {
             const int f = lo + fi;
+            Canvas tmp;
             Canvas* src = &canvas_;
-            if (f != frame_) { if (frameCanvasForExport(f, tmp)) src = &tmp; else continue; }
+            if (f != frame_) { if (!frameCanvasForExport(f, tmp)) return; src = &tmp; }
             const int baseY = fi * cellH;
             for (int li = 0; li < layers; li++) {
                 const int baseX = li * cellW;
@@ -5736,11 +5905,11 @@ std::string Engine::doMultiExport(const std::string& path, int kind, int scale, 
                     }
                 }
             }
-        }
+        }, compThreads);
         ExportResult r = writePngPixels(sheet.data(), (int)sw, (int)sh, path, compress);
         if (!r.ok) return "err " + r.err;
-        snprintf(msg, sizeof msg, "ok %lldx%lld %dx%d%s bytes=%lld", sw, sh, layers, frames,
-                 d25 ? " 2.5d" : "", r.bytes);
+        snprintf(msg, sizeof msg, "ok %lldx%lld %dx%d%s bytes=%lld ms=%ld", sw, sh, layers, frames,
+                 d25 ? " 2.5d" : "", r.bytes, elapsedMs());
         return msg;
     }
     return "err bad mode";
@@ -6117,6 +6286,20 @@ void Engine::renderScreen() {
     sel_.prepareMap(&selMap);
     // 浮层只覆盖屏幕一小块时, 先算它的屏幕包围盒, 让每像素热循环快速跳过
     int fsx0 = 0, fsx1 = -1, fsy0 = 0, fsy1 = -1;
+    if (fv && !selXf && !selExt && fW > 0 && fH > 0) {
+        // 未变换浮层: 直接用目标矩形算屏幕 bbox, 框外像素完全跳过
+        float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
+        const float px[4] = {(float)fDstX, (float)(fDstX + fW), (float)fDstX, (float)(fDstX + fW)};
+        const float py[4] = {(float)fDstY, (float)fDstY, (float)(fDstY + fH), (float)(fDstY + fH)};
+        for (int i = 0; i < 4; i++) {
+            float sxf = 0.f, syf = 0.f;
+            display_.canvasToScreenF(px[i], py[i], &sxf, &syf);
+            mnx = std::min(mnx, sxf); mxx = std::max(mxx, sxf);
+            mny = std::min(mny, syf); mxy = std::max(mxy, syf);
+        }
+        fsx0 = (int)std::floor(mnx) - 1; fsx1 = (int)std::ceil(mxx) + 1;
+        fsy0 = (int)std::floor(mny) - 1; fsy1 = (int)std::ceil(mxy) + 1;
+    }
     if ((selXf || selExt) && fv) {
         float q[8];
         sel_.corners(q);
@@ -6148,17 +6331,48 @@ void Engine::renderScreen() {
     // 2.5D 视角旋转时, 屏幕 x 方向对应画布 (cos, -sin) 方向; 非旋转时退化为 (1,0)
     const float dCx = display_.rot25Cos() * invz;
     const float dCy = -display_.rot25Sin() * invz;
+    // 画布在屏幕上的保守包围盒: 缩小/平移后画布只占视口一小块, 框外像素直接清零,
+    // 不再逐像素做 screenToCanvas 反算 + mip 查询(捏合烘棋盘时需要框外棋盘, 不裁)。
+    const bool clipOutside = !bakeChk && !replayOn;
+    int cbx0 = x0, cbx1 = x1, cby0 = y0, cby1 = y1;
+    if (clipOutside) {
+        const float cornerX[4] = {0.f, (float)cw, 0.f, (float)cw};
+        const float cornerY[4] = {0.f, 0.f, (float)ch, (float)ch};
+        float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
+        for (int i = 0; i < 4; i++) {
+            float sxf = 0.f, syf = 0.f;
+            display_.canvasToScreenF(cornerX[i], cornerY[i], &sxf, &syf);
+            mnx = std::min(mnx, sxf); mxx = std::max(mxx, sxf);
+            mny = std::min(mny, syf); mxy = std::max(mxy, syf);
+        }
+        cbx0 = std::max(x0, (int)std::floor(mnx) - 2);
+        cbx1 = std::min(x1, (int)std::ceil(mxx) + 2);
+        cby0 = std::max(y0, (int)std::floor(mny) - 2);
+        cby1 = std::min(y1, (int)std::ceil(mxy) + 2);
+    }
     auto renderBand = [&](int band, int bands) {
         const int syA = y0 + (rectH * band) / bands;
         const int syB = y0 + (rectH * (band + 1)) / bands - 1;
         if (plainCanvas) {
             for (int sy = syA; sy <= syB; sy++) {
+                uint32_t* drow = p + (size_t)(sy - y0) * stride;
+                if (clipOutside && (sy < cby0 || sy > cby1)) {
+                    memset(drow, 0, (size_t)rectW * 4);
+                    continue;
+                }
+                int lx0 = x0, lx1 = x1;
+                if (clipOutside) {
+                    lx0 = std::max(x0, cbx0);
+                    lx1 = std::min(x1, cbx1);
+                    if (lx0 > x0) memset(drow, 0, (size_t)(lx0 - x0) * 4);
+                    if (lx1 < x1) memset(drow + (lx1 - x0 + 1), 0, (size_t)(x1 - lx1) * 4);
+                    if (lx0 > lx1) continue;
+                }
                 float cxf = 0, cyf = 0;
                 display_.screenToCanvasF((float)x0, (float)sy, &cxf, &cyf);
-                uint32_t* drow = p + (size_t)(sy - y0) * stride;
                 int lastTx = INT_MIN, lastTy = INT_MIN;
                 const uint32_t* tile = nullptr;
-                for (int sx = x0; sx <= x1; sx++) {
+                for (int sx = lx0; sx <= lx1; sx++) {
                     const float cx = cxf + (sx - x0) * dCx;
                     const float cy = cyf + (sx - x0) * dCy;
                     uint32_t v = 0;
@@ -6181,12 +6395,24 @@ void Engine::renderScreen() {
             return;
         }
         for (int sy = syA; sy <= syB; sy++) {
+            uint32_t* drow = p + (size_t)(sy - y0) * stride;
+            if (clipOutside && (sy < cby0 || sy > cby1)) {
+                memset(drow, 0, (size_t)rectW * 4);
+                continue;
+            }
+            int lx0 = x0, lx1 = x1;
+            if (clipOutside) {
+                lx0 = std::max(x0, cbx0);
+                lx1 = std::min(x1, cbx1);
+                if (lx0 > x0) memset(drow, 0, (size_t)(lx0 - x0) * 4);
+                if (lx1 < x1) memset(drow + (lx1 - x0 + 1), 0, (size_t)(x1 - lx1) * 4);
+                if (lx0 > lx1) continue;
+            }
             float cxf = 0, cyf = 0;
             display_.screenToCanvasF((float)x0, (float)sy, &cxf, &cyf);
-            uint32_t* drow = p + (size_t)(sy - y0) * stride;
             int lastTx = INT_MIN, lastTy = INT_MIN;
             const uint32_t* tile = nullptr;
-            for (int sx = x0; sx <= x1; sx++) {
+            for (int sx = lx0; sx <= lx1; sx++) {
                 const float cx = cxf + (sx - x0) * dCx;
                 const float cy = cyf + (sx - x0) * dCy;
                 if (replayOn) {

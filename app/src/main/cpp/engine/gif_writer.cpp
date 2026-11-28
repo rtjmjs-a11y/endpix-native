@@ -34,6 +34,10 @@ bool GifWriter::begin(const std::string& path, int w, int h, int delayCentiSec) 
     f_ = fopen(path.c_str(), "wb");
     if (!f_) return false;
     w_ = w; h_ = h; delay_ = std::max(2, delayCentiSec); ok_ = true;
+    // 1<<20 个 (prefix<<8|next) 槽位; 代际标记避免每帧清零 4MB
+    lzwDict_.assign((size_t)1 << 20, 0);
+    lzwGen_.assign((size_t)1 << 20, 0);
+    lzwGenCur_ = 0;
     static const char sig[] = "GIF89a";
     writeBytes((const uint8_t*)sig, 6);
     u16((uint16_t)w); u16((uint16_t)h);
@@ -61,6 +65,7 @@ void GifWriter::writeFrame(const uint32_t* px) {
     pal.reserve(256);
     pal.push_back(0);            // 索引0: 全透明
     std::unordered_map<uint32_t, uint8_t> cmap;
+    std::unordered_map<uint32_t, uint8_t> mapped;   // 超出 255 色的最近色缓存(渐变图避免重复扫色表)
     // 注意: 不能预置 cmap[0]=0。纯黑 RGB(0,0,0) 的 key 也是 0, 会命中透明索引 0,
     // 导致不透明黑色像素整片消失。透明像素走下面的 a<128 分支, 不需要 map 记录。
     std::vector<uint8_t> idx((size_t)w_ * h_);
@@ -84,7 +89,11 @@ void GifWriter::writeFrame(const uint32_t* px) {
             pal.push_back((uint32_t)((b << 16) | (g << 8) | r));
             idx[i] = ni;
         } else {
-            idx[i] = (uint8_t)nearestColor(pal, r, g, b);
+            auto mi = mapped.find(key);
+            if (mi != mapped.end()) { idx[i] = mi->second; continue; }
+            const uint8_t ni = (uint8_t)nearestColor(pal, r, g, b);
+            if (mapped.size() < 4096) mapped[key] = ni;
+            idx[i] = ni;
         }
     }
     int bits = 1;
@@ -132,7 +141,10 @@ void GifWriter::lzwCompress(const std::vector<uint8_t>& indices, int minBits,
     int bitCount = 0;
     out.clear();
     out.reserve(indices.size() + indices.size() / 2 + 16);
-    std::unordered_map<int, int> dict;
+    // 新代际: 上一帧/上次清空留下的键全部失效, 不需要每次 memset 4MB
+    lzwGenCur_++;
+    if (lzwGenCur_ == 0) { std::fill(lzwGen_.begin(), lzwGen_.end(), 0u); lzwGenCur_ = 1; }
+    uint32_t gen = lzwGenCur_;
     auto putCode = [&](int code) {
         bitBuf |= (uint32_t)code << bitCount;
         bitCount += curBits;
@@ -142,21 +154,24 @@ void GifWriter::lzwCompress(const std::vector<uint8_t>& indices, int minBits,
     if (!indices.empty()) {
         int prefix = indices[0];
         for (size_t i = 1; i < indices.size(); i++) {
-            const int key = (prefix << 8) | indices[i];
-            auto it = dict.find(key);
-            if (it != dict.end()) { prefix = it->second; continue; }
+            const int next = indices[i];
+            const uint32_t key = ((uint32_t)prefix << 8) | (uint32_t)next;
+            if (lzwGen_[key] == gen) { prefix = lzwDict_[key]; continue; }
             putCode(prefix);
             if (nextCode <= 4095) {
                 if (nextCode > maxCode && curBits < 12) { curBits++; maxCode = (1 << curBits) - 1; }
-                dict[key] = nextCode++;
+                lzwDict_[key] = nextCode++;
+                lzwGen_[key] = gen;
             } else {
                 putCode(clearCode);
-                dict.clear();
+                lzwGenCur_++;
+                if (lzwGenCur_ == 0) { std::fill(lzwGen_.begin(), lzwGen_.end(), 0u); lzwGenCur_ = 1; }
+                gen = lzwGenCur_;
                 nextCode = endCode + 1;
                 curBits = minBits + 1;
                 maxCode = (1 << curBits) - 1;
             }
-            prefix = indices[i];
+            prefix = next;
         }
         putCode(prefix);
     }

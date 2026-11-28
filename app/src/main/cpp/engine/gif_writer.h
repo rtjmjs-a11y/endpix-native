@@ -20,11 +20,15 @@ private:
     void u16(uint16_t v);
     bool writeBytes(const uint8_t* p, size_t n);
     void writeFrame(const uint32_t* px);
-    static void lzwCompress(const std::vector<uint8_t>& indices, int minBits,
-                            std::vector<uint8_t>& out);
+    void lzwCompress(const std::vector<uint8_t>& indices, int minBits,
+                     std::vector<uint8_t>& out);
     FILE* f_ = nullptr;
     bool ok_ = true;
     int w_ = 0, h_ = 0, delay_ = 0;
+    // LZW 字典: key=(prefix<<8)|next (20 bit), 用"代号"代际数组代替每帧清空/哈希表
+    std::vector<int32_t> lzwDict_;
+    std::vector<uint32_t> lzwGen_;
+    uint32_t lzwGenCur_ = 0;
 };
 
 } // namespace endpix

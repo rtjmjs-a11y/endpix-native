@@ -180,11 +180,20 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
     int singleLayer = -2;
+    std::vector<int> vis;
     if (fastCompose) {
         int cnt = 0;
-        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; }
+        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; vis.push_back(l); }
         if (cnt != 1) singleLayer = -2;
     }
+    // 2.5D 时每层有位移, 逐像素现算(与 composeLayersPixelFast 一致); 其余走行级 tile 指针缓存
+    const raster::Mode25D& g25 = raster::mode25D();
+    const bool d25 = g25.on && g25.depth > 0 && nl > 1;
+    const bool rowFast = fastCompose && !d25 && !vis.empty();
+    const int ctx = canvas_->tilesX();
+    std::vector<const uint32_t*> ptrs(vis.size());
+    std::vector<uint32_t> scols(vis.size());
+    std::vector<uint8_t> solids(vis.size());
     for (int level = 0; level < 6; level++) {
         const bool recompute = (visibleLevel < 0 || visibleLevel == level);
         const int span = TS << level;
@@ -205,16 +214,57 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                 const int lx1 = std::min(TS - 1, (x1 - bx) >> level);
                 const int ly0 = std::max(0, (y0 - by) >> level);
                 const int ly1 = std::min(TS - 1, (y1 - by) >> level);
-                for (int ly = ly0; ly <= ly1; ly++) {
-                    const int cy = by + (ly << level);
-                    for (int lx = lx0; lx <= lx1; lx++) {
-                        const int cx = bx + (lx << level);
-                        uint32_t acc = 0;
-                        if (cx < cw && cy < ch)
-                            acc = singleLayer >= 0 ? canvas_->getPixelL(singleLayer, cx, cy)
-                                  : (fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
-                                                 : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false));
-                        t[(size_t)ly * TS + lx] = acc;
+                if (rowFast) {
+                    // 每行缓存各层 tile 指针/纯色, 避免逐像素 getPixelL 的查表;
+                    // 与 MipPyramid::tile 的快路径同语义(正常混合/不透明度100%)
+                    const int nv = (int)vis.size();
+                    for (int ly = ly0; ly <= ly1; ly++) {
+                        const int cy = by + (ly << level);
+                        uint32_t* trow = t + (size_t)ly * TS;
+                        if (cy >= ch) {
+                            for (int lx = lx0; lx <= lx1; lx++) trow[lx] = 0;
+                            continue;
+                        }
+                        const int tyi = cy >> Canvas::TILE_SHIFT;
+                        const int lyv = cy & (Canvas::TILE - 1);
+                        int lastTx = -1;
+                        for (int lx = lx0; lx <= lx1; lx++) {
+                            const int cx = bx + (lx << level);
+                            if (cx >= cw) { trow[lx] = 0; continue; }
+                            const int xt = cx >> Canvas::TILE_SHIFT;
+                            if (xt != lastTx) {
+                                const int ti = tyi * ctx + xt;
+                                for (int i = 0; i < nv; i++) {
+                                    const int l = vis[(size_t)i];
+                                    const bool s = canvas_->isSolidTile(l, ti);
+                                    solids[(size_t)i] = s ? 1 : 0;
+                                    scols[(size_t)i] = s ? canvas_->solidTileColor(l, ti) : 0;
+                                    ptrs[(size_t)i] = s ? nullptr : canvas_->tile(l, ti);
+                                }
+                                lastTx = xt;
+                            }
+                            const int off = (lyv << Canvas::TILE_SHIFT) + (cx & (Canvas::TILE - 1));
+                            uint32_t acc = 0;
+                            for (int i = 0; i < nv; i++) {
+                                const uint32_t v = solids[(size_t)i] ? scols[(size_t)i]
+                                    : (ptrs[(size_t)i] ? ptrs[(size_t)i][off] : 0);
+                                if (v) raster::overPixel(acc, v);
+                            }
+                            trow[lx] = acc;
+                        }
+                    }
+                } else {
+                    for (int ly = ly0; ly <= ly1; ly++) {
+                        const int cy = by + (ly << level);
+                        for (int lx = lx0; lx <= lx1; lx++) {
+                            const int cx = bx + (lx << level);
+                            uint32_t acc = 0;
+                            if (cx < cw && cy < ch)
+                                acc = singleLayer >= 0 ? canvas_->getPixelL(singleLayer, cx, cy)
+                                      : (fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
+                                                     : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false));
+                            t[(size_t)ly * TS + lx] = acc;
+                        }
                     }
                 }
             }

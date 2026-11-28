@@ -633,6 +633,26 @@ private:
     std::atomic<uint64_t> lastSavedRev_{0};
     void applyLevelsImpl(int channel, int black, int white, float gamma, int outBlack, int outWhite);
     void applyLevelsAllImpl(const uint8_t luts[4][256]);
+    // 快照序列化分帧作业: 自动保存(异步)不再一次性复制几十 MB 卡住渲染线程,
+    // 每帧只推进 ~2MB; 内容一旦变化(用户继续画)就中止, 等下一次空闲重来。
+    struct SnapJob {
+        enum Phase { START, TILES, FRAMES, SELSTATE, NAMES, HIST, ENDMETA, THUMB, DONE };
+        std::string path;
+        bool wait = false;
+        std::vector<uint8_t> buf;
+        int phase = START;
+        int lc = 0, l = 0, ti = 0;
+        int count = 0;
+        size_t frameIdx = 0;
+        bool histOk = false, histRedo = false;
+        size_t histIdx = 0;
+        uint64_t rev = 0, frameRev = 0, selRev = 0, layerRev = 0;
+        std::vector<uint32_t> thumb;
+    };
+    std::unique_ptr<SnapJob> snapJob_;
+    bool snapshotStep(SnapJob& j, size_t budgetBytes);   // true=序列化完成
+    void snapshotComplete(SnapJob& j);
+    void tickSnapshot();
     void saveSnapshotNow(const std::string& path, bool wait);
     void saveSnapshotForce(const std::string& path) {
         lastSavedRev_.store(0);

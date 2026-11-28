@@ -1,4 +1,5 @@
 #include "selection.h"
+#include "parallel.h"
 #include "../raster/raster.h"
 #include <algorithm>
 #include <chrono>
@@ -379,15 +380,21 @@ void SelectionTool::captureRect() {
     lastCut_.assign((size_t)w * h, 0u);
     const int layer = canvas_->active();
     const bool mk = !mask_.empty();
-    for (int y = 0; y < h; y++) {
-        uint32_t* row = lastCut_.data() + (size_t)y * w;
-        if (mk) {
-            const uint8_t* mr = mask_.data() + (size_t)y * maskW_;
-            for (int x = 0; x < w; x++) if (x < maskW_ && mr[x]) row[x] = canvas_->getPixelL(layer, x0_ + x, y0_ + y);
-        } else {
-            for (int x = 0; x < w; x++) row[x] = canvas_->getPixelL(layer, x0_ + x, y0_ + y);
+    // 大选区复制按行带并行(6000² 约 150ms → 4 核 ~40ms), 行间互不重叠
+    const int bands = std::min(h, 16);
+    parallelFor(bands, [&](int b) {
+        const int ya = (int)((long long)h * b / bands);
+        const int yb = (int)((long long)h * (b + 1) / bands);
+        for (int y = ya; y < yb; y++) {
+            uint32_t* row = lastCut_.data() + (size_t)y * w;
+            if (mk) {
+                const uint8_t* mr = mask_.data() + (size_t)y * maskW_;
+                for (int x = 0; x < w; x++) if (x < maskW_ && mr[x]) row[x] = canvas_->getPixelL(layer, x0_ + x, y0_ + y);
+            } else {
+                for (int x = 0; x < w; x++) row[x] = canvas_->getPixelL(layer, x0_ + x, y0_ + y);
+            }
         }
-    }
+    }, 4);
     lastW_ = w; lastH_ = h;
 }
 
@@ -1587,18 +1594,24 @@ void SelectionTool::cut() {
         const int tw = x1_ - x0_ + 1, th = y1_ - y0_ + 1;
         cropTargetW_ = tw; cropTargetH_ = th;
         cropTarget_.assign((size_t)tw * th, 0u);
-        if (!mask_.empty()) {
-            for (int y = 0; y < th; y++)
-                for (int x = 0; x < tw; x++)
-                    if (maskAt(x0_ + x, y0_ + y))
-                        cropTarget_[(size_t)y * tw + x] =
-                            raster::composeLayersPixel(*canvas_, x0_ + x, y0_ + y);
-        } else {
-            for (int y = 0; y < th; y++)
-                for (int x = 0; x < tw; x++)
-                    cropTarget_[(size_t)y * tw + x] =
-                        raster::composeLayersPixel(*canvas_, x0_ + x, y0_ + y);
-        }
+        // 可见层合成裁剪目标(裁剪导出/新标签打开用): 行带并行, 大选区不再冻结
+        const int cb = std::min(th, 16);
+        const bool cmk = !mask_.empty();
+        parallelFor(cb, [&](int b) {
+            const int ya = (int)((long long)th * b / cb);
+            const int yb = (int)((long long)th * (b + 1) / cb);
+            for (int y = ya; y < yb; y++) {
+                uint32_t* row = cropTarget_.data() + (size_t)y * tw;
+                if (cmk) {
+                    for (int x = 0; x < tw; x++)
+                        if (maskAt(x0_ + x, y0_ + y))
+                            row[x] = raster::composeLayersPixel(*canvas_, x0_ + x, y0_ + y);
+                } else {
+                    for (int x = 0; x < tw; x++)
+                        row[x] = raster::composeLayersPixel(*canvas_, x0_ + x, y0_ + y);
+                }
+            }
+        }, 4);
     }
     resetTransform();               // 旧 CutSelection: 新裁剪复位缩放/旋转
     extractToFloat();

@@ -1,6 +1,8 @@
 #include "psd_export.h"
+#include "parallel.h"
 #include "../raster/raster.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -68,6 +70,7 @@ struct LayerData {
 
 PsdResult exportPsd(const Canvas& c, const std::string& path) {
     PsdResult r;
+    const auto t0 = std::chrono::steady_clock::now();
     const int W = c.width(), H = c.height(), n = c.layers();
     if (W <= 0 || H <= 0 || n <= 0) { r.err = "empty"; return r; }
     const long long px = (long long)W * H;
@@ -80,51 +83,62 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
         layers[(size_t)l].visible = c.layerVisible(l);
         layers[(size_t)l].opacity = c.layerOpacity(l);
         for (int k = 0; k < 4; k++) layers[(size_t)l].plane[k].resize((size_t)px);
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                const uint32_t p = c.getPixelL(l, x, y);
-                const uint32_t a = (p >> 24) & 255u;
-                const uint8_t rr = unpremul(p & 255u, a);
-                const uint8_t gg = unpremul((p >> 8) & 255u, a);
-                const uint8_t bb = unpremul((p >> 16) & 255u, a);
-                const size_t o = (size_t)y * W + x;
-                layers[(size_t)l].plane[0][o] = rr;
-                layers[(size_t)l].plane[1][o] = gg;
-                layers[(size_t)l].plane[2][o] = bb;
-                layers[(size_t)l].plane[3][o] = (uint8_t)a;
-                if (layers[(size_t)l].visible && a) {
-                    uint32_t src = (a << 24) | (bb << 16) | (gg << 8) | rr;
-                    src = raster::applyLayerOpacity(src, layers[(size_t)l].opacity);
-                    raster::overPixel(comp[o], src);
+    }
+    // 行带并行: 每行只由一个线程写, 图层的 plane / comp 写区互不重叠;
+    // 像素内的图层顺序仍是 0..n-1, 合成结果和原来逐步一致。
+    {
+        const int bands = std::min(H, 16);
+        parallelFor(bands, [&](int b) {
+            const int y0 = (int)((long long)H * b / bands);
+            const int y1 = (int)((long long)H * (b + 1) / bands);
+            for (int y = y0; y < y1; y++) {
+                for (int l = 0; l < n; l++) {
+                    LayerData& ld = layers[(size_t)l];
+                    const bool vis = ld.visible;
+                    const float op = ld.opacity;
+                    for (int x = 0; x < W; x++) {
+                        const uint32_t p = c.getPixelL(l, x, y);
+                        const uint32_t a = (p >> 24) & 255u;
+                        const uint8_t rr = unpremul(p & 255u, a);
+                        const uint8_t gg = unpremul((p >> 8) & 255u, a);
+                        const uint8_t bb = unpremul((p >> 16) & 255u, a);
+                        const size_t o = (size_t)y * W + x;
+                        ld.plane[0][o] = rr;
+                        ld.plane[1][o] = gg;
+                        ld.plane[2][o] = bb;
+                        ld.plane[3][o] = (uint8_t)a;
+                        if (vis && a) {
+                            uint32_t src = (a << 24) | (bb << 16) | (gg << 8) | rr;
+                            src = raster::applyLayerOpacity(src, op);
+                            raster::overPixel(comp[o], src);
+                        }
+                    }
                 }
             }
-        }
+        }, 4);
     }
 
-    // 每层每通道: compression=1(RLE) + 行长度表 + 数据
-    std::vector<std::vector<uint8_t>> packed;
-    packed.reserve((size_t)n * 4);
-    for (int l = 0; l < n; l++) {
-        for (int ch = 0; ch < 4; ch++) {
-            std::vector<std::vector<uint8_t>> rows((size_t)H);
-            std::vector<uint8_t> chBuf;
-            chBuf.reserve((size_t)px + (size_t)H * 4);
-            be16(chBuf, 1);
-            size_t tablePos = chBuf.size();
-            chBuf.resize(chBuf.size() + (size_t)H * 2);
-            for (int y = 0; y < H; y++) {
-                rows[(size_t)y] = rleRow(layers[(size_t)l].plane[ch].data() + (size_t)y * W, W);
-                const size_t len = rows[(size_t)y].size();
-                chBuf[tablePos + (size_t)y * 2] = (uint8_t)((len >> 8) & 255);
-                chBuf[tablePos + (size_t)y * 2 + 1] = (uint8_t)(len & 255);
-            }
-            for (int y = 0; y < H; y++) {
-                const auto& row = rows[(size_t)y];
-                chBuf.insert(chBuf.end(), row.begin(), row.end());
-            }
-            packed.push_back(std::move(chBuf));
+    // 每层每通道: compression=1(RLE) + 行长度表 + 数据(层/通道互相独立, 并行打包)
+    std::vector<std::vector<uint8_t>> packed((size_t)n * 4);
+    parallelFor(n * 4, [&](int job) {
+        const int l = job / 4, ch = job % 4;
+        std::vector<std::vector<uint8_t>> rows((size_t)H);
+        std::vector<uint8_t>& chBuf = packed[(size_t)job];
+        chBuf.reserve((size_t)px + (size_t)H * 4);
+        be16(chBuf, 1);
+        const size_t tablePos = chBuf.size();
+        chBuf.resize(chBuf.size() + (size_t)H * 2);
+        for (int y = 0; y < H; y++) {
+            rows[(size_t)y] = rleRow(layers[(size_t)l].plane[ch].data() + (size_t)y * W, W);
+            const size_t len = rows[(size_t)y].size();
+            chBuf[tablePos + (size_t)y * 2] = (uint8_t)((len >> 8) & 255);
+            chBuf[tablePos + (size_t)y * 2 + 1] = (uint8_t)(len & 255);
         }
-    }
+        for (int y = 0; y < H; y++) {
+            const auto& row = rows[(size_t)y];
+            chBuf.insert(chBuf.end(), row.begin(), row.end());
+        }
+    }, 4);
 
     // 图层信息段
     std::vector<uint8_t> li;
@@ -177,26 +191,25 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
     out.insert(out.end(), li.begin(), li.end());
     be32(out, globalMaskLen);
 
-    // 合成图
+    // 合成图: 4 个通道互相独立, 并行反预乘 + RLE
     std::vector<uint8_t> compPlane[4];
-    for (int ch = 0; ch < 4; ch++) compPlane[ch].resize((size_t)px);
-    for (size_t i = 0; i < (size_t)px; i++) {
-        const uint32_t p = comp[i];
-        const uint32_t a = (p >> 24) & 255u;
-        compPlane[0][i] = unpremul(p & 255u, a);
-        compPlane[1][i] = unpremul((p >> 8) & 255u, a);
-        compPlane[2][i] = unpremul((p >> 16) & 255u, a);
-        compPlane[3][i] = (uint8_t)a;
-    }
-    be16(out, 1);
     std::vector<std::vector<uint8_t>> cRows[4];
-    for (int ch = 0; ch < 4; ch++) {
-        cRows[ch].resize((size_t)H);
-        for (int y = 0; y < H; y++) {
-            cRows[ch][(size_t)y] = rleRow(compPlane[ch].data() + (size_t)y * W, W);
-            be16(out, (uint32_t)cRows[ch][(size_t)y].size());
+    parallelFor(4, [&](int ch) {
+        compPlane[ch].resize((size_t)px);
+        for (size_t i = 0; i < (size_t)px; i++) {
+            const uint32_t p = comp[i];
+            const uint32_t a = (p >> 24) & 255u;
+            const int shift = ch == 0 ? 0 : (ch == 1 ? 8 : (ch == 2 ? 16 : 24));
+            compPlane[ch][i] = ch == 3 ? (uint8_t)a
+                                       : unpremul((p >> shift) & 255u, a);
         }
-    }
+        cRows[ch].resize((size_t)H);
+        for (int y = 0; y < H; y++)
+            cRows[ch][(size_t)y] = rleRow(compPlane[ch].data() + (size_t)y * W, W);
+    }, 4);
+    be16(out, 1);
+    for (int ch = 0; ch < 4; ch++)
+        for (int y = 0; y < H; y++) be16(out, (uint32_t)cRows[ch][(size_t)y].size());
     for (int ch = 0; ch < 4; ch++)
         for (int y = 0; y < H; y++) {
             const auto& row = cRows[ch][(size_t)y];
@@ -210,6 +223,8 @@ PsdResult exportPsd(const Canvas& c, const std::string& path) {
     if (wrote != out.size()) { r.err = "write failed"; return r; }
     r.ok = true;
     r.bytes = (long long)out.size();
+    r.ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t0).count();
     return r;
 }
 
