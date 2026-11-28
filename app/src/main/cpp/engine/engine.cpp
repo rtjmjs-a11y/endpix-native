@@ -2125,6 +2125,31 @@ void Engine::requestSliceImport(int canvasW, int frameH, int layers, int frames,
     if (queue_.size() < 4096) queue_.push_back({86, 0.0f, 0.0f, 0.0f});
 }
 
+void Engine::requestSheetImport(int sheetW, int sheetH, int cellW, int cellH, int cols, int rows,
+                                bool cropFrames, bool framesAcross, bool layered, int depth,
+                                std::vector<uint32_t> px) {
+    if (sheetW < 1 || sheetH < 1 || cellW < 1 || cellH < 1 || cols < 1 || rows < 1) return;
+    if (sheetW > 16834 || sheetH > 16834 || cellW > 16834 || cellH > 16834) return;
+    if (cols > 64 || rows > 64) return;
+    if ((long long)cellW * cols > sheetW || (long long)cellH * rows > sheetH) return;
+    if ((long long)sheetW * sheetH > 16ll * 1024 * 1024) return;
+    if (px.size() < (size_t)sheetW * sheetH) return;
+    {
+        std::lock_guard<std::mutex> lk(importMu_);
+        sheetImp_.sheetW = sheetW; sheetImp_.sheetH = sheetH;
+        sheetImp_.cellW = cellW; sheetImp_.cellH = cellH;
+        sheetImp_.cols = cols; sheetImp_.rows = rows;
+        sheetImp_.cropFrames = cropFrames;
+        sheetImp_.framesAcross = framesAcross;
+        sheetImp_.layered = layered;
+        sheetImp_.depth = std::max(0, std::min(20, depth));
+        sheetImp_.px = std::move(px);
+        sheetImpPending_ = true;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (queue_.size() < 4096) queue_.push_back({87, 0.0f, 0.0f, 0.0f});
+}
+
 void Engine::setImportTextImage(int w, int h, const std::vector<uint32_t>& px) {
     if (w <= 0 || h <= 0 || px.size() < (size_t)w * h) return;
     {
@@ -2275,7 +2300,16 @@ void Engine::doSliceImport() {
         serializeCanvasLocal(tmp, frames[(size_t)f]);
     }
 
-    // 一次性替换当前工程
+    installImportedProject(W, H, N, F, frames, d.names);
+    LOGI("slice import %dx%d layers=%d frames=%d frameH=%d", W, H, N, F, H);
+}
+
+// 把已经生成的帧 blob 一次性装成当前工程(切片/单 sheet 导入共用)
+void Engine::installImportedProject(int W, int H, int N, int frameCount,
+                                    std::vector<std::vector<uint8_t>>& frames,
+                                    const std::vector<std::string>& names) {
+    const int F = frameCount;
+    if (W < 1 || H < 1 || N < 1 || F < 1 || (int)frames.size() < F) return;
     sel_.clearState();
     sel_.deselect();
     canvas_.clearCutRect();
@@ -2293,8 +2327,8 @@ void Engine::doSliceImport() {
     layerCount_.store(N);
     activeLayer_.store(0);
     for (int l = 0; l < N; l++) {
-        if (l < (int)d.names.size() && !d.names[(size_t)l].empty())
-            canvas_.setLayerName(l, d.names[(size_t)l]);
+        if (l < (int)names.size() && !names[(size_t)l].empty())
+            canvas_.setLayerName(l, names[(size_t)l]);
         canvas_.setLayerVisible(l, true);
         canvas_.setLayerLocked(l, false);
         canvas_.setLayerMode(l, 0);
@@ -2314,7 +2348,138 @@ void Engine::doSliceImport() {
     thumbRev_.fetch_add(1);
     screenFull_ = true;
     refreshFrameThumbs();
-    LOGI("slice import %dx%d layers=%d frames=%d frameH=%d", W, H, N, F, H);
+}
+
+// 单张 sheet 导入(渲染线程): 网格 cellW×cellH; framesAcross=横排是帧/竖排是层。
+// layered=true: 每个交叉格成为对应层在该帧的内容; false: 交叉轴各格按顺序压成一帧(单层)。
+void Engine::doSheetImport() {
+    SheetImportData d;
+    {
+        std::lock_guard<std::mutex> lk(importMu_);
+        if (!sheetImpPending_) return;
+        d = std::move(sheetImp_);
+        sheetImp_ = SheetImportData();
+        sheetImpPending_ = false;
+    }
+    const int sw = d.sheetW, sh = d.sheetH, cw = d.cellW, ch = d.cellH;
+    if (sw < 1 || sh < 1 || cw < 1 || ch < 1 || d.cols < 1 || d.rows < 1) return;
+    if ((long long)sw * sh > 16ll * 1024 * 1024) return;
+    if (d.px.size() < (size_t)sw * sh) return;
+    const int cols = d.cols, rows = d.rows;
+    int F, N;
+    if (d.cropFrames) {
+        F = cols * rows; N = 1;
+    } else if (d.layered) {
+        if (d.framesAcross) { F = cols; N = rows; }
+        else { F = rows; N = cols; }
+    } else {
+        F = d.framesAcross ? cols : rows;
+        N = 1;
+    }
+    if (F < 1 || F > 512 || N < 1 || N > 32) return;
+    std::vector<std::string> names((size_t)N);
+    for (int l = 0; l < N; l++) names[(size_t)l] = "层" + std::to_string(l + 1);
+
+    Canvas tmp;
+    if (!tmp.create(cw, ch, N)) return;
+    const int tts = tmp.tilesX() * tmp.tilesY();
+    std::vector<std::vector<uint8_t>> frames((size_t)F);
+    std::vector<uint32_t> acc;
+    if (!d.layered) acc.assign((size_t)cw * ch, 0u);
+    for (int f = 0; f < F; f++) {
+        for (int l = 0; l < N; l++)
+            for (int ti = 0; ti < tts; ti++) tmp.releaseTile(l, ti);
+        if (d.cropFrames) {
+            // 裁剪帧: 所有格子按行优先各成一帧(单层)
+            const int col = f % cols, row = f / cols;
+            const int sx0 = col * cw, sy0 = row * ch;
+            if (sx0 + cw <= sw && sy0 + ch <= sh) {
+                for (int y = 0; y < ch; y++) {
+                    const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
+                    int x = 0;
+                    while (x < cw) {
+                        if (!rowp[x]) { x++; continue; }
+                        const int run = std::min(cw - x, Canvas::TILE - (x & (Canvas::TILE - 1)));
+                        uint32_t* t = tmp.tileForWrite(0, (y >> Canvas::TILE_SHIFT) * tmp.tilesX() +
+                                                          (x >> Canvas::TILE_SHIFT));
+                        memcpy(t + ((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+                                   (x & (Canvas::TILE - 1)), rowp + x, (size_t)run * 4);
+                        x += run;
+                    }
+                }
+            }
+        } else if (d.layered) {
+            for (int l = 0; l < N; l++) {
+                const int col = d.framesAcross ? f : l;
+                const int row = d.framesAcross ? l : f;
+                const int sx0 = col * cw, sy0 = row * ch;
+                if (sx0 + cw > sw || sy0 + ch > sh) continue;
+                for (int y = 0; y < ch; y++) {
+                    const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
+                    int x = 0;
+                    while (x < cw) {
+                        if (!rowp[x]) { x++; continue; }
+                        const int run = std::min(cw - x, Canvas::TILE - (x & (Canvas::TILE - 1)));
+                        uint32_t* t = tmp.tileForWrite(l, (y >> Canvas::TILE_SHIFT) * tmp.tilesX() +
+                                                           (x >> Canvas::TILE_SHIFT));
+                        memcpy(t + ((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+                                   (x & (Canvas::TILE - 1)), rowp + x, (size_t)run * 4);
+                        x += run;
+                    }
+                }
+            }
+        } else {
+            std::fill(acc.begin(), acc.end(), 0u);
+            const int cross = d.framesAcross ? rows : cols;
+            for (int c = 0; c < cross; c++) {
+                const int col = d.framesAcross ? f : c;
+                const int row = d.framesAcross ? c : f;
+                const int sx0 = col * cw, sy0 = row * ch;
+                if (sx0 + cw > sw || sy0 + ch > sh) continue;
+                for (int y = 0; y < ch; y++) {
+                    const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
+                    for (int x = 0; x < cw; x++) {
+                        const uint32_t v = rowp[x];
+                        if (v) raster::overPixel(acc[(size_t)y * cw + x], v);
+                    }
+                }
+            }
+            for (int y = 0; y < ch; y++) {
+                const uint32_t* rowp = acc.data() + (size_t)y * cw;
+                int x = 0;
+                while (x < cw) {
+                    if (!rowp[x]) { x++; continue; }
+                    const int run = std::min(cw - x, Canvas::TILE - (x & (Canvas::TILE - 1)));
+                    uint32_t* t = tmp.tileForWrite(0, (y >> Canvas::TILE_SHIFT) * tmp.tilesX() +
+                                                      (x >> Canvas::TILE_SHIFT));
+                    memcpy(t + ((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+                               (x & (Canvas::TILE - 1)), rowp + x, (size_t)run * 4);
+                    x += run;
+                }
+            }
+        }
+        frames[(size_t)f].reserve((size_t)32 + (size_t)N * (Canvas::TILE_PIX * 4 + 16));
+        serializeCanvasLocal(tmp, frames[(size_t)f]);
+    }
+    installImportedProject(cw, ch, N, F, frames, names);
+    if (d.layered && d.depth > 0) {
+        // 叠层导入: 同步开启 2.5D(时间轴图层设置里看到同样的开/高度)
+        auto& g = raster::mode25D();
+        g.on = true;
+        g.depth = std::max(1, std::min(20, d.depth));
+        g.dir = 0;
+        raster::setYaw25D(0);
+        display_.setRotation25(0);
+        m25OnA_.store(true);
+        m25DepthA_.store(g.depth);
+        m25DirA_.store(0);
+        layerMetaRev_++;
+        refreshLayerPropsCache();
+        mip_.invalidateRect(0, 0, cw - 1, ch - 1);
+        screenFull_ = true;
+    }
+    LOGI("sheet import %dx%d cell=%dx%d cols=%d rows=%d across=%d layered=%d depth=%d",
+         sw, sh, cw, ch, cols, rows, d.framesAcross ? 1 : 0, d.layered ? 1 : 0, d.depth);
 }
 
 // 选区内容整体旋转/翻转(即时提交, 走撤销记录)
@@ -3685,6 +3850,10 @@ void Engine::drainInput() {
         }
         if (e.action == 86) {   // 叠层切片导入: 一次性替换为多图层/多帧工程
             doSliceImport();
+            continue;
+        }
+        if (e.action == 87) {   // 单张 sheet 导入: 裁剪帧/并列帧/叠层
+            doSheetImport();
             continue;
         }
         if (e.action == 34) { sel_.copyRect(); lastCutSkip_.store(sel_.lastCutSkipped()); continue; }

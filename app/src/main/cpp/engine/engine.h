@@ -312,6 +312,11 @@ public:
                             std::vector<std::string> names,
                             std::vector<int> layerW, std::vector<int> layerH,
                             std::vector<uint32_t> px);
+    // 单张 sheet 导入: 网格 cellW×cellH; framesAcross=横排是帧/竖排是层;
+    // layered=true 每格成为一层的帧, false 则把交叉轴各格按顺序压成一帧; depth>0 时同步开启 2.5D
+    void requestSheetImport(int sheetW, int sheetH, int cellW, int cellH, int cols, int rows,
+                            bool cropFrames, bool framesAcross, bool layered, int depth,
+                            std::vector<uint32_t> px);
     void requestFlip(bool horizontal);
     void requestGrayscale();
     // 灰度观看(只改屏幕显示, 不动画布像素)
@@ -609,6 +614,18 @@ private:
     SliceImportData sliceImp_;
     bool sliceImpPending_ = false;
     void doSliceImport();
+    struct SheetImportData {
+        int sheetW = 0, sheetH = 0, cellW = 0, cellH = 0, cols = 0, rows = 0;
+        bool cropFrames = false, framesAcross = true, layered = false;
+        int depth = 0;
+        std::vector<uint32_t> px;
+    };
+    SheetImportData sheetImp_;
+    bool sheetImpPending_ = false;
+    void doSheetImport();
+    void installImportedProject(int w, int h, int layers, int frameCount,
+                                std::vector<std::vector<uint8_t>>& frames,
+                                const std::vector<std::string>& names);
     // 抽屉颜色调整/像素描边参数
     std::mutex selOpMu_;
     bool selAdjPending_ = false;

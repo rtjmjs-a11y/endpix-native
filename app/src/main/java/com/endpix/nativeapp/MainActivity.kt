@@ -2122,7 +2122,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                     bmp = com.endpix.nativeapp.ui.ExtraImageDecoders.decode(bytes)
                             }
                             if (bmp != null) {
-                                runOnUiThread { openImageAsNewTab(bmp, name) }
+                                runOnUiThread { showImageImport(bmp, name) }
                             } else {
                                 runOnUiThread {
                                     android.widget.Toast.makeText(this@MainActivity, "不是可识别的图像",
@@ -2130,8 +2130,16 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 }
                             }
                         } else {
-                            // 超大图: 分块按原尺寸导入(不缩水、不进裁剪浮层)
-                            runOnUiThread { openImageRegions(uri, iw, ih, name) }
+                            // 超大图: 先给缩略预览(单图像导入), 确认后仍分块按原尺寸导入
+                            val preview = decodeImagePreview(uri, iw, ih)
+                            if (preview == null) {
+                                runOnUiThread {
+                                    android.widget.Toast.makeText(this@MainActivity, "无法生成预览",
+                                        android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            } else {
+                                runOnUiThread { showImageImport(preview, name, uri, iw, ih) }
+                            }
                         }
                     } else {
                         // PSD / ASE 等系统解码不了的格式
@@ -2144,7 +2152,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                     android.widget.Toast.LENGTH_SHORT).show()
                             }
                         } else {
-                            runOnUiThread { openImageAsNewTab(bmp, name) }
+                            runOnUiThread { showImageImport(bmp, name) }
                         }
                     }
                 }
@@ -2199,6 +2207,118 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }, 250)
         android.widget.Toast.makeText(this, "项目已加载到新画布 ${dw}×${dh}",
             android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    // 超大图预览: 按 2 的幂降采样到 ~1200px 内, 只用于导入对话框
+    private fun decodeImagePreview(uri: android.net.Uri, w: Int, h: Int, maxDim: Int = 1200): android.graphics.Bitmap? {
+        var sample = 1
+        while (w / sample > maxDim || h / sample > maxDim) sample *= 2
+        val o = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        }
+        return try {
+            contentResolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, o)
+            }
+        } catch (_: Throwable) { null }
+    }
+
+    // 所有图像导入的统一入口: 先弹预览/导入方式, 用户确认后才建标签
+    private fun showImageImport(bmp: android.graphics.Bitmap, name: String,
+                                uri: android.net.Uri? = null,
+                                fullW: Int = bmp.width, fullH: Int = bmp.height) {
+        // 标签满了也先给预览; 真正导入时 addTab 会拒绝并提示
+        val preview = try { bmp.asImageBitmap() } catch (_: Throwable) { null }
+        if (preview == null) { openImageAsNewTab(bmp, name); return }
+        com.endpix.nativeapp.ui.ImageImportHub.show(
+            name, fullW, fullH, preview, uri == null,
+            onImport = { plan ->
+                if (plan.mode == 0) {
+                    if (uri != null) {
+                        // 超大图: 预览是缩略图, 真正导入仍走分块原尺寸
+                        openImageRegions(uri, fullW, fullH, name)
+                        bmp.recycle()
+                    } else {
+                        openImageAsNewTab(bmp, name)
+                    }
+                } else {
+                    importImageSheet(bmp, plan, name)
+                }
+            },
+            onCancel = { bmp.recycle() }
+        )
+    }
+
+    // 当前画布"导入图片"(浮动层)也必须先预览确认; 这个入口只支持单图像
+    private fun showImageInsertPreview(bmp: android.graphics.Bitmap, name: String) {
+        val preview = try { bmp.asImageBitmap() } catch (_: Throwable) { null }
+        if (preview == null) { insertImageIntoCanvas(bmp); return }
+        com.endpix.nativeapp.ui.ImageImportHub.show(
+            name, bmp.width, bmp.height, preview, false,
+            onImport = { plan -> if (plan.mode == 0) insertImageIntoCanvas(bmp) else bmp.recycle() },
+            onCancel = { bmp.recycle() }
+        )
+    }
+
+    private fun insertImageIntoCanvas(bmp: android.graphics.Bitmap) {
+        val w = bmp.width
+        val h = bmp.height
+        val argb = IntArray(w * h)
+        bmp.getPixels(argb, 0, w, 0, 0, w, h)
+        for (i in argb.indices) {
+            val c = argb[i]
+            argb[i] = (c and 0xFF00FF00.toInt()) or ((c and 0xFF) shl 16) or ((c ushr 16) and 0xFF)
+        }
+        pendingImportW = w
+        pendingImportH = h
+        pendingImportPx = argb
+        flushPendingImport()
+        bmp.recycle()
+    }
+
+    // 裁剪帧 / 并列帧 / 叠层 导入单张 sheet
+    private fun importImageSheet(bmp: android.graphics.Bitmap,
+                                 plan: com.endpix.nativeapp.ui.ImageImportPlan, name: String) {
+        val w = bmp.width
+        val h = bmp.height
+        if (w.toLong() * h > 16_000_000L) {
+            bmp.recycle()
+            android.widget.Toast.makeText(this, "图像过大，无法按格切分导入", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        val argb = IntArray(w * h)
+        bmp.getPixels(argb, 0, w, 0, 0, w, h)
+        bmp.recycle()
+        for (i in argb.indices) {
+            val c = argb[i]
+            argb[i] = (c and 0xFF00FF00.toInt()) or ((c and 0xFF) shl 16) or ((c ushr 16) and 0xFF)
+        }
+        val cw = plan.cellW.coerceIn(1, w)
+        val ch = plan.cellH.coerceIn(1, h)
+        val cols = maxOf(1, w / cw)
+        val rows = maxOf(1, h / ch)
+        val crop = plan.mode == 1
+        val layered = plan.layered && !crop
+        val frames = if (crop) cols * rows
+                     else if (plan.framesAcross) cols else rows
+        val layers = if (!layered) 1 else if (plan.framesAcross) rows else cols
+        if (frames !in 1..512 || layers !in 1..32) {
+            android.widget.Toast.makeText(this, "格子太多（帧≤512、层≤32）", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!addTab(cw, ch)) return
+        val id = activeTabState.intValue
+        renameTab(id, "图像${cw}×$ch".take(12))
+        noteTabSize(id, cw, ch)
+        try {
+            nativeImportSheet(w, h, cw, ch, cols, rows, crop,
+                plan.framesAcross, layered, plan.depth, argb)
+        } catch (_: Throwable) { }
+        handler.postDelayed({ saveActiveTab() }, 800)
+        android.widget.Toast.makeText(this,
+            "已导入 ${layers} 层 / ${frames} 帧 ($cw×$ch)",
+            android.widget.Toast.LENGTH_LONG).show()
     }
 
     private fun openImageAsNewTab(bmp: android.graphics.Bitmap, name: String) {
@@ -3169,21 +3289,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 this@MainActivity, "图片解码失败", android.widget.Toast.LENGTH_SHORT
                             ).show()
                         }
-                        if (bmp != null) {
-                            val w = bmp.width; val h = bmp.height
-                            val argb = IntArray(w * h)
-                            bmp.getPixels(argb, 0, w, 0, 0, w, h)
-                            for (i in argb.indices) {
-                                val c = argb[i]
-                                argb[i] = (c and 0xFF00FF00.toInt()) or
-                                    ((c and 0xFF) shl 16) or ((c ushr 16) and 0xFF)
-                            }
-                            pendingImportW = w
-                            pendingImportH = h
-                            pendingImportPx = argb
-                            flushPendingImport()
-                            bmp.recycle()
-                        }
+                        if (bmp != null) showImageInsertPreview(bmp, displayName(uri))
                     }
                 } catch (_: Exception) { }
             }
@@ -3960,6 +4066,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
                 // 叠层切片导入对话框(加载文件选中 zip 后弹出)
                 com.endpix.nativeapp.ui.SliceImportDialog()
+                // 通用图像导入预览(单图像/裁剪帧/并列帧/叠层)
+                com.endpix.nativeapp.ui.ImageImportDialog()
                 }
             }
         }
@@ -4673,6 +4781,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private external fun nativeImportSlices(w: Int, frameH: Int, layers: Int, frames: Int,
                                             names: Array<String>, layerW: IntArray,
                                             layerH: IntArray, px: IntArray)
+    private external fun nativeImportSheet(sheetW: Int, sheetH: Int, cellW: Int, cellH: Int,
+                                           cols: Int, rows: Int, cropFrames: Boolean,
+                                           framesAcross: Boolean, layered: Boolean,
+                                           depth: Int, px: IntArray)
     private external fun nativeCanvasSize(): IntArray?
     private external fun nativeSnapshotDims(path: String): IntArray?
     private external fun nativeFrameCount(): Int

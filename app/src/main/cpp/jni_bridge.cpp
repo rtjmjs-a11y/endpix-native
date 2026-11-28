@@ -888,6 +888,22 @@ Java_com_endpix_nativeapp_MainActivity_nativeImportSlices(JNIEnv* env, jobject, 
                                 std::move(lw), std::move(lh), std::move(buf));
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_endpix_nativeapp_MainActivity_nativeImportSheet(JNIEnv* env, jobject, jint sheetW, jint sheetH,
+                                                         jint cellW, jint cellH, jint cols, jint rows,
+                                                         jboolean cropFrames, jboolean framesAcross,
+                                                         jboolean layered, jint depth, jintArray px) {
+    if (!gEngine || !px) return;
+    if (sheetW <= 0 || sheetH <= 0 || cellW <= 0 || cellH <= 0 || cols <= 0 || rows <= 0) return;
+    const jsize n = env->GetArrayLength(px);
+    if (n < (jlong)sheetW * sheetH) return;
+    std::vector<uint32_t> buf((size_t)n);
+    env->GetIntArrayRegion(px, 0, n, (jint*)buf.data());
+    gEngine->requestSheetImport(sheetW, sheetH, cellW, cellH, cols, rows,
+                                cropFrames == JNI_TRUE, framesAcross == JNI_TRUE,
+                                layered == JNI_TRUE, depth, std::move(buf));
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_endpix_nativeapp_MainActivity_nativeReadRegion(JNIEnv* env, jobject, jint x, jint y,
                                                         jint w, jint h) {
