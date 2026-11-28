@@ -519,6 +519,21 @@ Java_com_endpix_nativeapp_MainActivity_nativeMinimapViewport(JNIEnv* env, jobjec
     env->SetFloatArrayRegion(out, 0, 4, v);
 }
 
+// 2.5D: 视口四边形(归一化, 8 float), 红线按旋转方向画
+extern "C" JNIEXPORT void JNICALL
+Java_com_endpix_nativeapp_MainActivity_nativeMinimapViewportQuad(JNIEnv* env, jobject, jfloatArray out) {
+    if (!out || env->GetArrayLength(out) < 8) return;
+    float v[8] = {0.f, 0.f, 1.f, 0.f, 1.f, 1.f, 0.f, 1.f};
+    if (gEngine) gEngine->minimapViewportQuad(v);
+    env->SetFloatArrayRegion(out, 0, 8, v);
+}
+
+// 小地图旋转按钮: 2.5D 视角角增量
+extern "C" JNIEXPORT void JNICALL
+Java_com_endpix_nativeapp_MainActivity_nativeRotate25D(JNIEnv*, jobject, jfloat deltaDeg) {
+    if (gEngine) gEngine->requestRotate25D(deltaDeg);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_endpix_nativeapp_MainActivity_nativeMinimapPoint(JNIEnv* env, jobject, jfloat nx, jfloat ny, jfloatArray out) {
     if (!out || env->GetArrayLength(out) < 2) return;
@@ -891,6 +906,7 @@ Java_com_endpix_nativeapp_MainActivity_nativeImportSlices(JNIEnv* env, jobject, 
 extern "C" JNIEXPORT void JNICALL
 Java_com_endpix_nativeapp_MainActivity_nativeImportSheet(JNIEnv* env, jobject, jint sheetW, jint sheetH,
                                                          jint cellW, jint cellH, jint cols, jint rows,
+                                                         jint offX, jint offY,
                                                          jboolean cropFrames, jboolean framesAcross,
                                                          jboolean layered, jint depth, jintArray px) {
     if (!gEngine || !px) return;
@@ -899,7 +915,7 @@ Java_com_endpix_nativeapp_MainActivity_nativeImportSheet(JNIEnv* env, jobject, j
     if (n < (jlong)sheetW * sheetH) return;
     std::vector<uint32_t> buf((size_t)n);
     env->GetIntArrayRegion(px, 0, n, (jint*)buf.data());
-    gEngine->requestSheetImport(sheetW, sheetH, cellW, cellH, cols, rows,
+    gEngine->requestSheetImport(sheetW, sheetH, cellW, cellH, cols, rows, offX, offY,
                                 cropFrames == JNI_TRUE, framesAcross == JNI_TRUE,
                                 layered == JNI_TRUE, depth, std::move(buf));
 }

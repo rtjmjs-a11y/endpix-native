@@ -2545,10 +2545,11 @@ private fun MinimapPanel(
     }
     // 旧项目 MinimapHandler.Update: 每帧刷新红框. 这里同样逐帧向引擎查询视口,
     // 只在数值变化时失效 Canvas 重绘(不重组、不等 stats)
-    val vpState = remember { mutableStateOf(floatArrayOf(0f, 0f, 1f, 1f)) }
+    // 2.5D: 视口是旋转后的四边形(8 个归一化坐标), 红线才会跟着视角转
+    val vpState = remember { mutableStateOf(floatArrayOf(0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f)) }
     val vpCb by rememberUpdatedState(viewportProvider)
     LaunchedEffect(Unit) {
-        val tmp = FloatArray(4)
+        val tmp = FloatArray(8)
         while (true) {
             withFrameNanos { }
             try { vpCb(tmp) } catch (_: Throwable) { continue }
@@ -2571,8 +2572,9 @@ private fun MinimapPanel(
             .border(1.dp, Ep.Line, RoundedCornerShape(4.dp))
             .padding(pad)
     ) {
+        Box(Modifier.size(thumbBox)) {
         Canvas(
-            Modifier.size(thumbBox)
+            Modifier.fillMaxSize()
                 .pointerInput(canvasW, canvasH) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
@@ -2626,13 +2628,26 @@ private fun MinimapPanel(
             }
             val vp = vpState.value
             clipRect(o.x, o.y, o.x + sz.width, o.y + sz.height) {
-                drawRect(
-                    Color(0xFFFF2626),
-                    topLeft = Offset(o.x + vp[0] * sz.width, o.y + vp[1] * sz.height),
-                    size = Size(vp[2] * sz.width, vp[3] * sz.height),
-                    style = Stroke(1.5.dp.toPx())
-                )
+                // 2.5D: 视口四角在旋转后的缩略图上是一个四边形; 非旋转时退化为矩形
+                if (vp.size >= 8) {
+                    val path = androidx.compose.ui.graphics.Path()
+                    path.moveTo(o.x + vp[0] * sz.width, o.y + vp[1] * sz.height)
+                    path.lineTo(o.x + vp[2] * sz.width, o.y + vp[3] * sz.height)
+                    path.lineTo(o.x + vp[4] * sz.width, o.y + vp[5] * sz.height)
+                    path.lineTo(o.x + vp[6] * sz.width, o.y + vp[7] * sz.height)
+                    path.close()
+                    drawPath(path, Color(0xFFFF2626), style = Stroke(1.5.dp.toPx()))
+                }
             }
+        }
+        // 2.5D 旋转按钮: 贴在缩略图右上/右下, 不影响拖动导航
+        if (MinimapNavHub.mode25On) {
+            Column(Modifier.align(Alignment.TopEnd).padding(2.dp)) {
+                PanelMiniBtn("⟲", btnS) { MinimapNavHub.rotate?.invoke(-15f) }
+                Spacer(Modifier.height(2.dp))
+                PanelMiniBtn("⟳", btnS) { MinimapNavHub.rotate?.invoke(15f) }
+            }
+        }
         }
         Spacer(Modifier.height(2.dp))
         Row(Modifier.fillMaxWidth().height(rowH), verticalAlignment = Alignment.CenterVertically) {

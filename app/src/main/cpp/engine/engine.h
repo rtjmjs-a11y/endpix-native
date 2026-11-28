@@ -135,6 +135,8 @@ public:
     }
     // 小地图红框: 屏幕视口在画布中的归一化矩形(旧 UpdateViewport 的本地化; UI 每帧查询)
     void minimapViewportNormalized(float* out);
+    // 2.5D: 视口在旋转后小地图 bbox 里的四角(归一化, 8 个 float), 红线按旋转方向画
+    void minimapViewportQuad(float* out);
     // 小地图归一化坐标 → 画布坐标(2.5D 旋转时逆变换, 与缩略图/红框同一套 bbox)
     void minimapPointToCanvas(float nx, float ny, float* out);
     void setViewState(float z, float px, float py) {
@@ -315,8 +317,10 @@ public:
     // 单张 sheet 导入: 网格 cellW×cellH; framesAcross=横排是帧/竖排是层;
     // layered=true 每格成为一层的帧, false 则把交叉轴各格按顺序压成一帧; depth>0 时同步开启 2.5D
     void requestSheetImport(int sheetW, int sheetH, int cellW, int cellH, int cols, int rows,
+                            int offX, int offY,
                             bool cropFrames, bool framesAcross, bool layered, int depth,
                             std::vector<uint32_t> px);
+    void requestRotate25D(float deltaDeg);   // 小地图旋转按钮: 视角角增量
     void requestFlip(bool horizontal);
     void requestGrayscale();
     // 灰度观看(只改屏幕显示, 不动画布像素)
@@ -636,6 +640,7 @@ private:
     void doSliceImport();
     struct SheetImportData {
         int sheetW = 0, sheetH = 0, cellW = 0, cellH = 0, cols = 0, rows = 0;
+        int offX = 0, offY = 0;    // 初始裁剪偏移(网格起点)
         bool cropFrames = false, framesAcross = true, layered = false;
         int depth = 0;
         std::vector<uint32_t> px;
@@ -746,6 +751,7 @@ private:
     void makeThumb(int frame, int layer, std::vector<uint32_t>& out);
     void makeCompositeThumb(std::vector<uint32_t>& out);
     void refreshFrameThumbs();
+    void refreshAllFrameThumbs();   // 帧数/层数变化后: 所有帧格缩略图一起重建
     void refreshMinimapThumb();
     bool frameThumb(int frame, int layer, uint32_t* out, int n);
     bool layerThumb(int frame, int layer, uint32_t* out, int n);

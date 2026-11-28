@@ -194,6 +194,48 @@ uint32_t composeLayersPixelEx(const Canvas& c, int x, int y, bool showGrid, bool
     return acc;
 }
 
+// 2.5D 外溢: 目标坐标可以越出画布, 只要某层的错位源点还在画布内就照常合成。
+// 主画布只在 2.5D 查看模式用(叠层被裁在画布边界上会显得被棋盘格"吃掉")。
+uint32_t composeLayersPixelExOut(const Canvas& c, int x, int y, bool showGrid) {
+    const int nl = c.layers();
+    const Mode25D& g = mode25D();
+    if (!(g.on && g.depth > 0 && nl > 1)) return 0;
+    const int cw = c.width(), ch = c.height();
+    uint32_t acc = 0;
+    for (int l = 0; l < nl; l++) {
+        if (!c.layerVisible(l)) continue;
+        const int mode = c.layerMode(l);
+        if (mode == 2) continue;
+        const int off = l * g.depth;
+        const int ox = (int)std::lround(g.offX * off);
+        const int oy = (int)std::lround(g.offY * off);
+        const int sx = x - ox, sy = y - oy;
+        if (sx < 0 || sy < 0 || sx >= cw || sy >= ch) continue;
+        if (c.cutActive() && c.cutLayer() >= 0 && l == c.cutLayer() &&
+            sx >= c.cutX0() && sx <= c.cutX1() && sy >= c.cutY0() && sy <= c.cutY1()) continue;
+        const int maskA = clipMaskAlpha(c, l, sx, sy);
+        if (maskA == 0) continue;
+        uint32_t v = applyLayerOpacity(c.getPixelL(l, sx, sy), c.layerOpacity(l));
+        if (v) {
+            v = scaleAlpha(v, maskA);
+            acc = blendPixel(acc, v, c.layerBlend(l));
+        }
+        if (showGrid && mode == 1 && c.layerShowGrid(l)) {
+            const int tw = std::max(1, c.layerTileW(l));
+            const int th = std::max(1, c.layerTileH(l));
+            const int gox = c.layerTileOffX(l), goy = c.layerTileOffY(l);
+            const int mx = ((x - gox) % tw + tw) % tw;
+            const int my = ((y - goy) % th + th) % th;
+            if (mx == 0 || my == 0) {
+                uint32_t gc = c.layerGridColor(l);
+                if ((gc >> 24) == 0) gc |= 0x66000000u;
+                raster::overPixel(acc, gc);
+            }
+        }
+    }
+    return acc;
+}
+
 // 普通层快路径: 只做可见层 over, 跳过每像素的图层属性/蒙版/2.5D 判断。
 // 只在语义与 composeLayersPixelEx 完全一致时使用(否则调用方回退)。
 bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, bool applyCut) {

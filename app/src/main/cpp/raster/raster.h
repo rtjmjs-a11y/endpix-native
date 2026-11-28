@@ -41,6 +41,9 @@ uint32_t composeLayersPixel(const Canvas& c, int x, int y);
 // applyCut: 是否应用"剪切矩形只挖空被剪层"的蒙版(mip 构建必须 false, 否则浮层采样会读到空)
 uint32_t composeLayersPixelEx(const Canvas& c, int x, int y, bool showGrid, bool view25d,
                               bool applyCut = true);
+// 2.5D 外溢显示: x/y 允许落在画布外(向上层错位后越出画布的部分也要画出来)。
+// 逐层采样仍检查源坐标是否在画布内; 画布外且没有层内容的像素返回 0。
+uint32_t composeLayersPixelExOut(const Canvas& c, int x, int y, bool showGrid);
 // 普通层快路径: 无蒙版/无2.5D/无平铺网格/不透明度100%/正常混合/不应用裁剪时可用
 bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, bool applyCut);
 uint32_t composeLayersPixelFast(const Canvas& c, int x, int y);

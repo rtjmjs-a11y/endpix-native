@@ -15,4 +15,7 @@ object StatsHub {
     var autoSaveMin by mutableIntStateOf(0)
     var autoSaveRemain by mutableIntStateOf(-1)
     var autoSaveSaving by mutableStateOf(false)
+    // 导入/重建工程后 4 秒内把 stats 轮询加快到 ~12Hz: 帧数/层数/缩略图立刻出现在时间轴,
+    // 不用等满 500ms 一轮("导入后要一会儿才看得见")
+    @Volatile var fastUntilMs: Long = 0L
 }

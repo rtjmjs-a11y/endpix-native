@@ -772,6 +772,14 @@ bool Engine::snapshotStep(SnapJob& j, size_t budgetBytes) {
             // v7: 每层混合模式(正片叠底/滤色/叠加/...)
             put32((uint32_t)j.lc);
             for (int l = 0; l < j.lc; l++) put32((uint32_t)canvas_.layerBlend(l));
+            // 2.5D 视角角(尾段追加, 仍标 v8: 旧版本读到混合模式就停, 忽略尾部字节不会报错)
+            {
+                const auto& g = raster::mode25D();
+                float yv = g.yawDeg;
+                uint32_t yb = 0;
+                memcpy(&yb, &yv, 4);
+                put32(yb);
+            }
             j.phase = SnapJob::THUMB;
             break;
         case SnapJob::THUMB: {
@@ -929,15 +937,18 @@ void Engine::loadSnapshotNow(const std::string& path) {
         LOGI("snapshot load: bad size %ux%u", w, h);
         return;
     }
-    if ((int)w != canvas_.width() || (int)h != canvas_.height()) {
+    // 层数是工程自己的属性: 切到层数更少的标签时必须收回到快照的层数,
+    // 否则 frameLayerCount_(上一标签/导入工程的最大层数)会把这个标签补出一堆空层。
+    if ((int)w != canvas_.width() || (int)h != canvas_.height() ||
+        canvas_.layers() != std::max(1, (int)lc)) {
         sel_.clearState();
         canvas_.create((int)w, (int)h, std::max(1, (int)lc));
         display_.resizeCanvas((int)w, (int)h);
         mip_.reset(&canvas_);
     }
-    const int targetLc = std::max((int)lc, frameLayerCount_);
+    const int targetLc = std::max(1, (int)lc);
     while (canvas_.layers() < targetLc) canvas_.addLayer();
-    frameLayerCount_ = std::max(frameLayerCount_, canvas_.layers());
+    frameLayerCount_ = targetLc;
     for (int l = 0; l < canvas_.layers(); l++)
         for (int ti = 0; ti < canvas_.tilesX() * canvas_.tilesY(); ti++)
             canvas_.releaseTile(l, ti);
@@ -1172,6 +1183,19 @@ void Engine::loadSnapshotNow(const std::string& path) {
         }
     } else {
         for (int l = 0; l < canvas_.layers(); l++) canvas_.setLayerBlend(l, 0);
+    }
+    // 2.5D 视角角(尾段): 有就读, 老存档没有则回正面。视角属于"查看状态", 2.5D 关闭时忽略。
+    {
+        float yv = 0.f;
+        if (p + 4 <= buf.size()) {
+            uint32_t yb = 0;
+            if (rd(p, yb)) memcpy(&yv, &yb, 4);
+        }
+        if (!(yv > -360.f && yv < 360.f)) yv = 0.f;
+        const auto& g = raster::mode25D();
+        const float use = g.on ? yv : 0.f;
+        raster::setYaw25D(use);
+        display_.setRotation25(use);
     }
     if (ver >= 2 && (long long)canvas_.width() * canvas_.height() <= 4ll * 1024 * 1024) {
         std::lock_guard<std::mutex> lk(thumbMu_);
@@ -1415,8 +1439,44 @@ void Engine::minimapViewportNormalized(float* out) {
     out[3] = std::max(0.f, std::min(1.f, y1 - y0));
 }
 
+void Engine::refreshAllFrameThumbs() {
+    const int F = std::max(1, (int)frameData_.size());
+    const int N = canvas_.layers();
+    if (N <= 0) return;
+    // 极多格子(如 512 帧×32 层)不一次全建, 只刷当前帧, 其余点开时间轴再按需
+    if ((long long)F * N > 2048) {
+        if ((int)frameThumbs_.size() <= frame_) frameThumbs_.resize((size_t)frame_ + 1);
+        auto& ft = frameThumbs_[(size_t)frame_];
+        ft.assign((size_t)N, std::vector<uint32_t>((size_t)THUMB * THUMB, 0u));
+        for (int l = 0; l < N; l++) makeThumb(frame_, l, ft[(size_t)l]);
+    } else {
+        frameThumbs_.assign((size_t)F, std::vector<std::vector<uint32_t>>(
+            (size_t)N, std::vector<uint32_t>((size_t)THUMB * THUMB, 0u)));
+        for (int f = 0; f < F; f++)
+            for (int l = 0; l < N; l++)
+                layerThumb(f, l, frameThumbs_[(size_t)f][(size_t)l].data(), THUMB * THUMB);
+    }
+    {
+        std::vector<uint32_t> comp;
+        makeCompositeThumb(comp);
+        std::lock_guard<std::mutex> lk(thumbMu_);
+        compositeThumb_.swap(comp);
+    }
+    if (minimapActive_.load(std::memory_order_relaxed)) refreshMinimapThumb();
+    thumbRev_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Engine::refreshFrameThumbs() {
     if (frame_ < 0) return;
+    // 帧数/层数变化(导入、加删帧、加删层)后不能只刷当前帧: 时间轴其它帧格会全空
+    const int wantF = std::max(1, (int)frameData_.size());
+    const int wantN = canvas_.layers();
+    if ((int)frameThumbs_.size() != wantF ||
+        (frame_ < (int)frameThumbs_.size() &&
+         (int)frameThumbs_[(size_t)frame_].size() != wantN)) {
+        refreshAllFrameThumbs();
+        return;
+    }
     if ((int)frameThumbs_.size() <= frame_) frameThumbs_.resize((size_t)frame_ + 1);
     auto& ft = frameThumbs_[(size_t)frame_];
     ft.resize((size_t)canvas_.layers());
@@ -1493,6 +1553,42 @@ void Engine::refreshMinimapThumb() {
     }
     std::lock_guard<std::mutex> lk(thumbMu_);
     minimapThumb_.swap(tmp);
+}
+
+// 2.5D: 视口四角映射到"旋转后小地图 bbox"的归一化坐标(8 float: x0,y0,x1,y1,...)
+// 小地图红线按这四点画四边形, 才能跟着旋转方向走, 而不是一个轴对齐外接框。
+void Engine::minimapViewportQuad(float* out) {
+    if (!out) return;
+    const float vw = (float)display_.viewW(), vh = (float)display_.viewH();
+    const float w = (float)std::max(1, canvas_.width());
+    const float h = (float)std::max(1, canvas_.height());
+    const raster::Mode25D& g25 = raster::mode25D();
+    const bool use25 = g25.on && (g25.depth > 0 || std::fabs(g25.yawDeg) > 0.01f);
+    float rc = 1.f, rs = 0.f, bbox = 1.f;
+    if (use25) {
+        const float rad = g25.yawDeg * 3.14159265358979f / 180.f;
+        rc = std::cos(rad); rs = std::sin(rad);
+        bbox = std::fabs(rc) + std::fabs(rs);
+    }
+    const float sx[4] = {0.f, vw, vw, 0.f};
+    const float sy[4] = {0.f, 0.f, vh, vh};
+    for (int i = 0; i < 4; i++) {
+        float cx = 0.f, cy = 0.f;
+        display_.screenToCanvasF(sx[i], sy[i], &cx, &cy);
+        float nx, ny;
+        if (!use25) {
+            nx = cx / w;
+            ny = cy / h;
+        } else {
+            const float px = cx / w - 0.5f, py = cy / h - 0.5f;
+            const float u = rc * px - rs * py;
+            const float v = rs * px + rc * py;
+            nx = u / bbox + 0.5f;
+            ny = v / bbox + 0.5f;
+        }
+        out[i * 2] = nx;
+        out[i * 2 + 1] = ny;
+    }
 }
 
 // 小地图点击 → 画布坐标(2.5D 时做同样的逆旋转; UI 拖动/点击都走这里)
@@ -2161,6 +2257,12 @@ void Engine::requestReset25DView() {
     if (queue_.size() < 4096) queue_.push_back({98, 0, 0, 0});
 }
 
+// 小地图旋转按钮: 视角角增量(度)
+void Engine::requestRotate25D(float deltaDeg) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (queue_.size() < 4096) queue_.push_back({99, deltaDeg, 0, 0});
+}
+
 // 渲染线程: 更新2.5D视角(yaw), 同步 shader 旋转 + mip(层错位)+整屏
 void Engine::applyYaw25D(float deg) {
     raster::setYaw25D(deg);
@@ -2245,12 +2347,15 @@ void Engine::requestSliceImport(int canvasW, int frameH, int layers, int frames,
 }
 
 void Engine::requestSheetImport(int sheetW, int sheetH, int cellW, int cellH, int cols, int rows,
+                                int offX, int offY,
                                 bool cropFrames, bool framesAcross, bool layered, int depth,
                                 std::vector<uint32_t> px) {
     if (sheetW < 1 || sheetH < 1 || cellW < 1 || cellH < 1 || cols < 1 || rows < 1) return;
     if (sheetW > 16834 || sheetH > 16834 || cellW > 16834 || cellH > 16834) return;
     if (cols > 64 || rows > 64) return;
-    if ((long long)cellW * cols > sheetW || (long long)cellH * rows > sheetH) return;
+    if (offX < 0 || offY < 0) return;
+    if ((long long)offX + (long long)cellW * cols > sheetW ||
+        (long long)offY + (long long)cellH * rows > sheetH) return;
     if ((long long)sheetW * sheetH > 16ll * 1024 * 1024) return;
     if (px.size() < (size_t)sheetW * sheetH) return;
     {
@@ -2258,6 +2363,7 @@ void Engine::requestSheetImport(int sheetW, int sheetH, int cellW, int cellH, in
         sheetImp_.sheetW = sheetW; sheetImp_.sheetH = sheetH;
         sheetImp_.cellW = cellW; sheetImp_.cellH = cellH;
         sheetImp_.cols = cols; sheetImp_.rows = rows;
+        sheetImp_.offX = offX; sheetImp_.offY = offY;
         sheetImp_.cropFrames = cropFrames;
         sheetImp_.framesAcross = framesAcross;
         sheetImp_.layered = layered;
@@ -2444,7 +2550,7 @@ void Engine::installImportedProject(int W, int H, int N, int frameCount,
     frameRev_.fetch_add(1);
     thumbRev_.fetch_add(1);
     screenFull_ = true;
-    refreshFrameThumbs();
+    refreshAllFrameThumbs();   // 整个工程换掉: 每个帧格都必须重建(旧工程同尺寸同层数时不能走增量)
 }
 
 // 单张 sheet 导入(渲染线程): 网格 cellW×cellH; framesAcross=横排是帧/竖排是层。
@@ -2462,6 +2568,8 @@ void Engine::doSheetImport() {
     if (sw < 1 || sh < 1 || cw < 1 || ch < 1 || d.cols < 1 || d.rows < 1) return;
     if ((long long)sw * sh > 16ll * 1024 * 1024) return;
     if (d.px.size() < (size_t)sw * sh) return;
+    const int offX = std::max(0, std::min(d.offX, sw - 1));
+    const int offY = std::max(0, std::min(d.offY, sh - 1));
     const int cols = d.cols, rows = d.rows;
     int F, N;
     if (d.cropFrames) {
@@ -2489,7 +2597,7 @@ void Engine::doSheetImport() {
         if (d.cropFrames) {
             // 裁剪帧: 所有格子按行优先各成一帧(单层)
             const int col = f % cols, row = f / cols;
-            const int sx0 = col * cw, sy0 = row * ch;
+            const int sx0 = offX + col * cw, sy0 = offY + row * ch;
             if (sx0 + cw <= sw && sy0 + ch <= sh) {
                 for (int y = 0; y < ch; y++) {
                     const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
@@ -2509,7 +2617,7 @@ void Engine::doSheetImport() {
             for (int l = 0; l < N; l++) {
                 const int col = d.framesAcross ? f : l;
                 const int row = d.framesAcross ? l : f;
-                const int sx0 = col * cw, sy0 = row * ch;
+                const int sx0 = offX + col * cw, sy0 = offY + row * ch;
                 if (sx0 + cw > sw || sy0 + ch > sh) continue;
                 for (int y = 0; y < ch; y++) {
                     const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
@@ -2531,7 +2639,7 @@ void Engine::doSheetImport() {
             for (int c = 0; c < cross; c++) {
                 const int col = d.framesAcross ? f : c;
                 const int row = d.framesAcross ? c : f;
-                const int sx0 = col * cw, sy0 = row * ch;
+                const int sx0 = offX + col * cw, sy0 = offY + row * ch;
                 if (sx0 + cw > sw || sy0 + ch > sh) continue;
                 for (int y = 0; y < ch; y++) {
                     const uint32_t* rowp = d.px.data() + (size_t)(sy0 + y) * sw + sx0;
@@ -4548,6 +4656,15 @@ void Engine::drainInput() {
         }
         if (e.action == 98) {   // 2.5D 旋转视角: yaw 归零
             applyYaw25D(0);
+            continue;
+        }
+        if (e.action == 99) {   // 2.5D 视角增量(小地图 ⟲/⟳ 按钮)
+            const auto& g = raster::mode25D();
+            if (g.on) {
+                float ny = std::fmod(g.yawDeg + e.x, 360.f);
+                if (ny < 0.f) ny += 360.f;
+                applyYaw25D(ny);
+            }
             continue;
         }
         if (e.action == 40) {
@@ -7229,8 +7346,17 @@ void Engine::renderScreen() {
     const bool onNext = onionActive && !onionNext_.empty();
     const int rectW = x1 - x0 + 1;
     const int rectH = y1 - y0 + 1;
+    // 2.5D: 上层沿视角方向错位 (层数-1)*depth, 越出画布的部分也要显示(否则被画布边界
+    // 外的底色/棋盘"吃掉")。pad 用画布像素, 屏幕包围盒按 zoom 放大。
+    int pad25 = 0;
+    {
+        const auto& g25 = raster::mode25D();
+        if (!replayOn && g25.on && g25.depth > 0 && canvas_.layers() > 1)
+            pad25 = (canvas_.layers() - 1) * g25.depth;
+    }
+    const bool pad25on = pad25 > 0;
     const bool plainCanvas = plainPathOn_ && !replayOn && !cut && !fv && !selExt && !selXf &&
-                             !lvOn && !onPrev && !onNext && !measLoupe;
+                             !lvOn && !onPrev && !onNext && !measLoupe && !pad25on;
     // 2.5D 视角旋转时, 屏幕 x 方向对应画布 (cos, -sin) 方向; 非旋转时退化为 (1,0)
     const float dCx = display_.rot25Cos() * invz;
     const float dCy = -display_.rot25Sin() * invz;
@@ -7248,10 +7374,10 @@ void Engine::renderScreen() {
             mnx = std::min(mnx, sxf); mxx = std::max(mxx, sxf);
             mny = std::min(mny, syf); mxy = std::max(mxy, syf);
         }
-        cbx0 = std::max(x0, (int)std::floor(mnx) - 2);
-        cbx1 = std::min(x1, (int)std::ceil(mxx) + 2);
-        cby0 = std::max(y0, (int)std::floor(mny) - 2);
-        cby1 = std::min(y1, (int)std::ceil(mxy) + 2);
+        cbx0 = std::max(x0, (int)std::floor(mnx) - 2 - (pad25on ? (int)std::ceil(pad25 * zoom) : 0));
+        cbx1 = std::min(x1, (int)std::ceil(mxx) + 2 + (pad25on ? (int)std::ceil(pad25 * zoom) : 0));
+        cby0 = std::max(y0, (int)std::floor(mny) - 2 - (pad25on ? (int)std::ceil(pad25 * zoom) : 0));
+        cby1 = std::min(y1, (int)std::ceil(mxy) + 2 + (pad25on ? (int)std::ceil(pad25 * zoom) : 0));
     }
     auto renderBand = [&](int band, int bands) {
         const int syA = y0 + (rectH * band) / bands;
@@ -7495,6 +7621,11 @@ void Engine::renderScreen() {
                             if (base) { raster::overPixel(base, v); v = base; }
                         }
                     }
+                } else if (pad25on) {
+                    // 画布外: 2.5D 上层错位溢出画布的部分(只画在 pad 范围内)
+                    const int icx = (int)std::floor(cx), icy = (int)std::floor(cy);
+                    if (icx >= -pad25 && icy >= -pad25 && icx < cw + pad25 && icy < ch + pad25)
+                        v = raster::composeLayersPixelExOut(canvas_, icx, icy, true);
                 }
                 // 图形工具预览已经直接画进画布像素(和落层同源), 这里不再叠加屏幕预览
                 // bbox 未算(普通浮层移动/未变换)时不做提前跳过

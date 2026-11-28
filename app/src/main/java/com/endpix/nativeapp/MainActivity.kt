@@ -2319,8 +2319,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         val cw = plan.cellW.coerceIn(1, w)
         val ch = plan.cellH.coerceIn(1, h)
-        val cols = maxOf(1, w / cw)
-        val rows = maxOf(1, h / ch)
+        // 网格起点允许偏移(裁掉原图边距/角标); 可用区域按偏移后的长宽计算
+        val offX = plan.offX.coerceIn(0, maxOf(0, w - 1))
+        val offY = plan.offY.coerceIn(0, maxOf(0, h - 1))
+        val cols = maxOf(1, (w - offX) / cw)
+        val rows = maxOf(1, (h - offY) / ch)
         val crop = plan.mode == 1
         val layered = plan.layered && !crop
         val frames = if (crop) cols * rows
@@ -2335,9 +2338,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         renameTab(id, "图像${cw}×$ch".take(12))
         noteTabSize(id, cw, ch)
         try {
-            nativeImportSheet(w, h, cw, ch, cols, rows, crop,
+            nativeImportSheet(w, h, cw, ch, cols, rows, offX, offY, crop,
                 plan.framesAcross, layered, plan.depth, argb)
         } catch (_: Throwable) { }
+        // 导入后立刻加快 stats 轮询: 帧数/层数/缩略图不必等 500ms 一轮才出现
+        com.endpix.nativeapp.ui.StatsHub.fastUntilMs =
+            android.os.SystemClock.elapsedRealtime() + 4000L
         handler.postDelayed({ saveActiveTab() }, 800)
         android.widget.Toast.makeText(this,
             "已导入 ${layers} 层 / ${frames} 帧 ($cw×$ch)",
@@ -2495,6 +2501,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun saveCanvasStyle(s: com.endpix.nativeapp.ui.CanvasStyleSettings) {
         canvasStyleState.value = s
+        com.endpix.nativeapp.ui.CanvasStyleHub.style = s   // 导入预览的网格线/棋盘跟随画布
         // 导出预览的棋盘色跟随画布外观
         com.endpix.nativeapp.ui.ExportHub.chkA = s.chkA
         com.endpix.nativeapp.ui.ExportHub.chkB = s.chkB
@@ -2793,6 +2800,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             try { nativeMinimapPoint(nx, ny, o) } catch (_: Throwable) { }
             o
         }
+        com.endpix.nativeapp.ui.MinimapNavHub.rotate = { d ->
+            try { nativeRotate25D(d) } catch (_: Throwable) { }
+        }
         // 系统截屏: 立即收起横屏菜单/☰(Android 14+ 有系统回调; 三指截图另有触摸预判)
         if (android.os.Build.VERSION.SDK_INT >= 34) {
             try {
@@ -2928,6 +2938,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 outsideBg = p.getInt("csOutsideBg", 0xFF0D1117.toInt()),
                 magnifier = p.getBoolean("csMagnifier", true)
             )
+            com.endpix.nativeapp.ui.CanvasStyleHub.style = canvasStyleState.value
             // 后台/进程恢复: 工具、笔刷、叠色、图形、选择与时间轴等全部 UI 状态
             toolState.intValue = p.getInt("uiTool", 0).coerceIn(0, 5)
             brushColorState.intValue = p.getInt("uiBrushColor", 0xFF111111.toInt())
@@ -3509,18 +3520,27 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 val r = nativeThumbRevision()
                                 if (r != thumbRevState.intValue) thumbRevState.intValue = r
                             } catch (_: Throwable) { }
-                            delay(500)   // 2Hz: 全屏 stats 重组更少, 悬浮窗拖动/绘制更稳
+                            delay(if (android.os.SystemClock.elapsedRealtime() <
+                                    com.endpix.nativeapp.ui.StatsHub.fastUntilMs) 80L else 500L)
                         }
                     }
                     // 小地图 2.5D 旋转: 面板打开时 30Hz 查缩略图版本。
                     // 只写 MinimapNavHub(面板自己重组), 不走 MainScreen 的 thumbRev 参数, 避免整屏重组。
                     LaunchedEffect(Unit) {
+                        var tick = 0
                         while (true) {
                             if (minimapOnState.value) {
                                 try {
                                     val r = nativeThumbRevision()
                                     if (r != com.endpix.nativeapp.ui.MinimapNavHub.rev.intValue)
                                         com.endpix.nativeapp.ui.MinimapNavHub.rev.intValue = r
+                                    // 2.5D 状态(旋转按钮显示): 每 ~330ms 查一次, 不必 30Hz
+                                    if (tick++ % 10 == 0) {
+                                        val m = nativeGet25D()
+                                        val on = m != null && m.isNotEmpty() && m[0] != 0
+                                        if (on != com.endpix.nativeapp.ui.MinimapNavHub.mode25On)
+                                            com.endpix.nativeapp.ui.MinimapNavHub.mode25On = on
+                                    }
                                 } catch (_: Throwable) { }
                                 delay(33)
                             } else {
@@ -3886,7 +3906,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                         onMinimapBounds = { r ->
                             minimapBoundsPx = android.graphics.RectF(r.left, r.top, r.right, r.bottom)
                         },
-                        minimapViewport = { out -> nativeMinimapViewport(out) },
+                        minimapViewport = { out -> nativeMinimapViewportQuad(out) },
                         minimapBg = minimapBgState.intValue,
                         onMinimapBg = { m ->
                             minimapBgState.intValue = if (m in 1..3) m else 3
@@ -4835,7 +4855,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                                             names: Array<String>, layerW: IntArray,
                                             layerH: IntArray, px: IntArray)
     private external fun nativeImportSheet(sheetW: Int, sheetH: Int, cellW: Int, cellH: Int,
-                                           cols: Int, rows: Int, cropFrames: Boolean,
+                                           cols: Int, rows: Int, offX: Int, offY: Int,
+                                           cropFrames: Boolean,
                                            framesAcross: Boolean, layered: Boolean,
                                            depth: Int, px: IntArray)
     private external fun nativeCanvasSize(): IntArray?
@@ -5085,6 +5106,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private external fun nativeExportThumb(): IntArray?
     private external fun nativeSetMinimapActive(on: Int)
     private external fun nativeMinimapViewport(out: FloatArray)
+    private external fun nativeMinimapViewportQuad(out: FloatArray)
+    private external fun nativeRotate25D(deltaDeg: Float)
     private external fun nativeMinimapPoint(nx: Float, ny: Float, out: FloatArray)
     private external fun nativeAnimateViewCenter(cx: Float, cy: Float, animate: Int)
     private external fun nativeSetLoopRange(start: Int, end: Int)
