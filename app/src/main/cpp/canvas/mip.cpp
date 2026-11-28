@@ -21,22 +21,83 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
-    int singleLayer = -2;
     if (fastCompose) {
-        int cnt = 0;
-        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; }
-        if (cnt != 1) singleLayer = -2;
-    }
-    for (int y = 0; y < TS; y++) {
-        const int cy = y0 + y * stride;
-        uint32_t* drow = buf.get() + (size_t)y * TS;
-        if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
-        for (int x = 0; x < TS; x++) {
-            const int cx = x0 + x * stride;
-            if (cx >= cw) { drow[x] = 0; continue; }
-            drow[x] = singleLayer >= 0 ? canvas_->getPixelL(singleLayer, cx, cy)
-                      : (fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
-                                     : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false));
+        std::vector<int> vis;
+        vis.reserve(nl);
+        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) vis.push_back(l);
+        const int nv = (int)vis.size();
+        const int ctx = canvas_->tilesX();
+        if (nv == 1) {
+            const int l = vis[0];
+            for (int y = 0; y < TS; y++) {
+                const int cy = y0 + y * stride;
+                uint32_t* drow = buf.get() + (size_t)y * TS;
+                if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+                const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
+                int lastTx = -1;
+                const uint32_t* pt = nullptr;
+                bool solid = false;
+                uint32_t scol = 0;
+                for (int x = 0; x < TS; x++) {
+                    const int cx = x0 + x * stride;
+                    if (cx >= cw) { drow[x] = 0; continue; }
+                    const int tx = cx >> Canvas::TILE_SHIFT;
+                    if (tx != lastTx) {
+                        const int ti = tyi * ctx + tx;
+                        solid = canvas_->isSolidTile(l, ti);
+                        scol = solid ? canvas_->solidTileColor(l, ti) : 0;
+                        pt = solid ? nullptr : canvas_->tile(l, ti);
+                        lastTx = tx;
+                    }
+                    drow[x] = solid ? scol : (pt ? pt[((size_t)ly << Canvas::TILE_SHIFT) +
+                                                   (cx & (Canvas::TILE - 1))] : 0);
+                }
+            }
+        } else {
+            std::vector<const uint32_t*> ptrs(nv);
+            std::vector<uint32_t> scols(nv);
+            std::vector<uint8_t> solids(nv);
+            for (int y = 0; y < TS; y++) {
+                const int cy = y0 + y * stride;
+                uint32_t* drow = buf.get() + (size_t)y * TS;
+                if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+                const int tyi = cy >> Canvas::TILE_SHIFT, ly = cy & (Canvas::TILE - 1);
+                int lastTx = -1;
+                for (int x = 0; x < TS; x++) {
+                    const int cx = x0 + x * stride;
+                    if (cx >= cw) { drow[x] = 0; continue; }
+                    const int tx = cx >> Canvas::TILE_SHIFT;
+                    if (tx != lastTx) {
+                        const int ti = tyi * ctx + tx;
+                        for (int i = 0; i < nv; i++) {
+                            const int l = vis[i];
+                            const bool s = canvas_->isSolidTile(l, ti);
+                            solids[i] = s ? 1 : 0;
+                            scols[i] = s ? canvas_->solidTileColor(l, ti) : 0;
+                            ptrs[i] = s ? nullptr : canvas_->tile(l, ti);
+                        }
+                        lastTx = tx;
+                    }
+                    const int off = (ly << Canvas::TILE_SHIFT) + (cx & (Canvas::TILE - 1));
+                    uint32_t acc = 0;
+                    for (int i = 0; i < nv; i++) {
+                        const uint32_t v = solids[i] ? scols[i] : (ptrs[i] ? ptrs[i][off] : 0);
+                        if (v) raster::overPixel(acc, v);
+                    }
+                    drow[x] = acc;
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < TS; y++) {
+            const int cy = y0 + y * stride;
+            uint32_t* drow = buf.get() + (size_t)y * TS;
+            if (cy >= ch) { memset(drow, 0, (size_t)TS * 4); continue; }
+            for (int x = 0; x < TS; x++) {
+                const int cx = x0 + x * stride;
+                if (cx >= cw) { drow[x] = 0; continue; }
+                drow[x] = raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+            }
         }
     }
     {
