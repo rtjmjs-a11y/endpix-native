@@ -794,7 +794,7 @@ void GlDisplay::draw() {
     glUniform2f(uCenter_, orgX + cw_ * 0.5f * dz, (float)vh_ - orgY - ch_ * 0.5f * dz);
     glUniform2f(uCanvasSize_, (float)cw_, (float)ch_);
     glUniform1f(uChkOn_, (chkOn_ && !drawBaked_) ? 1.0f : 0.0f);
-    glUniform1f(uGridOn_, gridOn_ ? 1.0f : 0.0f);
+    glUniform1f(uGridOn_, (gridOn_ && !drawBaked_) ? 1.0f : 0.0f);
     glUniform1f(uGridW_, gridW_);
     glUniform1f(uGridH_, gridH_);
     glUniform3f(uGridColor_, gridR_, gridG_, gridB_);

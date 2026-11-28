@@ -84,7 +84,7 @@ public:
     // 套索/魔棒精确轮廓: 线段 x0,y0,x1,y1...(画布坐标); 空=回到 bbox 蚂蚁线
     void setSelectionOutline(const std::vector<int>& segs);
     void setOverlay(bool checker, bool grid);   // 棋盘格/网格开关
-    // 捏合期间把棋盘格直接烘进屏幕缓冲: 棋盘格与画布同一帧, 不会出现"棋盘格跟不上画布"
+    // 捏合期间把棋盘格/网格线直接烘进屏幕缓冲: 与画布同一帧, 不会出现"跟不上画布/线条丢失"
     void setBakeChecker(bool on) { bakeChecker_ = on; }
     inline uint32_t bakeCheckerPixel(float cx, float cy, bool inside, uint32_t v) const {
         if (!bakeChecker_) return v;
@@ -101,10 +101,29 @@ public:
         const float r = (float)(v & 255u) / 255.0f;
         const float g = (float)((v >> 8) & 255u) / 255.0f;
         const float b = (float)((v >> 16) & 255u) / 255.0f;
-        const uint32_t rr = (uint32_t)std::lround((r * a + br * (1.0f - a)) * 255.0f);
-        const uint32_t gg = (uint32_t)std::lround((g * a + bg * (1.0f - a)) * 255.0f);
-        const uint32_t bb2 = (uint32_t)std::lround((b * a + bb * (1.0f - a)) * 255.0f);
-        return 0xFF000000u | (bb2 << 16) | (gg << 8) | rr;
+        float rr = r * a + br * (1.0f - a);
+        float gg = g * a + bg * (1.0f - a);
+        float bb2 = b * a + bb * (1.0f - a);
+        // 捏合期间网格线也烘进同一帧: 与画布/棋盘格同步, 不再靠 shader 用上一帧变换画线
+        if (inside && gridOn_ && gridA_ > 0.001f) {
+            const float gx = std::max(gridW_ * zoom_, 4.0f);
+            const float gy = std::max(gridH_ * zoom_, 4.0f);
+            if (gx >= 6.0f && gy >= 6.0f) {
+                const float sx = cx * zoom_, sy = cy * zoom_;
+                const float fx = sx - std::floor(sx / gx) * gx;
+                const float fy = sy - std::floor(sy / gy) * gy;
+                const float lw = std::max(gridLineW_, 0.5f);
+                if (fx <= lw || fy <= lw) {
+                    rr = rr * (1.0f - gridA_) + gridR_ * gridA_;
+                    gg = gg * (1.0f - gridA_) + gridG_ * gridA_;
+                    bb2 = bb2 * (1.0f - gridA_) + gridB_ * gridA_;
+                }
+            }
+        }
+        const uint32_t rr8 = (uint32_t)std::lround(rr * 255.0f);
+        const uint32_t gg8 = (uint32_t)std::lround(gg * 255.0f);
+        const uint32_t bb8 = (uint32_t)std::lround(bb2 * 255.0f);
+        return 0xFF000000u | (bb8 << 16) | (gg8 << 8) | rr8;
     }
     // 放大镜窗口(屏幕像素, 含边框): 网格不再盖到镜面上, 镜内由 CPU 画放大后的网格
     void setLoupeRect(int x0, int y0, int x1, int y1) {
