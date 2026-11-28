@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -25,7 +24,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -34,9 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -118,7 +114,6 @@ private const val SHORTCUT_LONG_MS = 450L
 
 @Composable
 fun ShortcutButton(modifier: Modifier = Modifier) {
-    var progress by remember { mutableFloatStateOf(0f) }
     var pressing by remember { mutableStateOf(false) }
     var pressStart by remember { mutableLongStateOf(0L) }
     var fired by remember { mutableStateOf(false) }
@@ -129,11 +124,9 @@ fun ShortcutButton(modifier: Modifier = Modifier) {
         while (pressing) {
             withFrameNanos { }
             val held = (System.nanoTime() - pressStart) / 1_000_000L
-            progress = (held / SHORTCUT_LONG_MS.toFloat()).coerceIn(0f, 1f)
             if (held >= SHORTCUT_LONG_MS) {
                 fired = true
                 pressing = false
-                progress = 0f
                 ShortcutHub.invoke(ShortcutPrefs.longId)
                 break
             }
@@ -161,28 +154,12 @@ fun ShortcutButton(modifier: Modifier = Modifier) {
                         }
                     }
                     pressing = false
-                    progress = 0f
                     if (!fired && !canceled) ShortcutHub.invoke(ShortcutPrefs.shortId)
                 }
             },
         contentAlignment = Alignment.Center
     ) {
         EpIcon(15, Color.White, size = 22.dp)
-        if (progress > 0.01f) {
-            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
-                val stroke = 2.2.dp.toPx()
-                val inset = stroke * 0.5f + 1.5.dp.toPx()
-                drawArc(
-                    color = Ep.Accent,
-                    startAngle = -90f,
-                    sweepAngle = 360f * progress,
-                    useCenter = false,
-                    topLeft = Offset(inset, inset),
-                    size = androidx.compose.ui.geometry.Size(size.width - inset * 2, size.height - inset * 2),
-                    style = Stroke(width = stroke)
-                )
-            }
-        }
     }
 }
 
