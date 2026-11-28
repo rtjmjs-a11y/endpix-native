@@ -85,45 +85,98 @@ public:
     void setSelectionOutline(const std::vector<int>& segs);
     void setOverlay(bool checker, bool grid);   // 棋盘格/网格开关
     // 捏合期间把棋盘格/网格线直接烘进屏幕缓冲: 与画布同一帧, 不会出现"跟不上画布/线条丢失"
-    void setBakeChecker(bool on) { bakeChecker_ = on; }
+    void setBakeChecker(bool on) {
+        bakeChecker_ = on;
+        if (!on) return;
+        // 烘帧期间每像素都要算棋盘/网格: 提前把除数换成倒数, 颜色换成 8 位整数,
+        // 热循环里不再做除法/浮点混合/ lround(三次 libm 调用)。
+        // 棋盘格 cell=chkTile_*zoom, 屏幕坐标 sx=cx*zoom ⇒ sx/cell == cx/chkTile_, zoom 直接约掉。
+        const float gx = gridW_ * zoom_, gy = gridH_ * zoom_;
+        bakeGridOn_ = gridOn_ && gridA_ > 0.001f &&
+                      gx >= 6.0f && gy >= 6.0f && gridW_ > 0.001f && gridH_ > 0.001f;
+        bakeChkFast_ = chkTile_ * zoom_ >= 4.0f && chkTile_ > 0.001f;
+        bakeInvChk_ = bakeChkFast_ ? 1.0f / chkTile_ : 1.0f;
+        bakeInvGw_ = gridW_ > 0.001f ? 1.0f / gridW_ : 1.0f;
+        bakeInvGh_ = gridH_ > 0.001f ? 1.0f / gridH_ : 1.0f;
+        // 线宽按屏幕 px 定义, 换算到画布单位比较
+        bakeLwC_ = std::max(gridLineW_, 0.5f) / std::max(zoom_, 1e-4f);
+        auto to8 = [](float v) -> int {
+            const int x = (int)(v * 255.0f + (v >= 0.0f ? 0.5f : -0.5f));
+            return x < 0 ? 0 : (x > 255 ? 255 : x);
+        };
+        bakeBg8_ = to8(bgR_) | (to8(bgG_) << 8) | (to8(bgB_) << 16);
+        bakeChkA8_ = to8(chkAR_) | (to8(chkAG_) << 8) | (to8(chkAB_) << 16);
+        bakeChkB8_ = to8(chkBR_) | (to8(chkBG_) << 8) | (to8(chkBB_) << 16);
+        bakeGrid8_ = to8(gridR_) | (to8(gridG_) << 8) | (to8(gridB_) << 16);
+        bakeGridA8_ = std::max(0, std::min(255, to8(gridA_)));
+    }
+    // 只算棋盘/画布外底色(不叠网格): 供"同一画布像素整段填充"的快路径复用
+    inline uint32_t bakeBaseColor(float cx, float cy, bool inside, uint32_t v) const {
+        const int a = (int)((v >> 24) & 255u);
+        const int r = (int)(v & 255u), g = (int)((v >> 8) & 255u), b = (int)((v >> 16) & 255u);
+        uint32_t base = bakeBg8_;
+        if (inside && chkOn_ && a < 255) {
+            int chk;
+            if (bakeChkFast_) {
+                chk = ((int)(cx * bakeInvChk_) + (int)(cy * bakeInvChk_)) & 1;
+            } else {
+                const float cell = std::max(chkTile_ * zoom_, 4.0f);
+                chk = ((int)std::floor(cx * zoom_ / cell) +
+                       (int)std::floor(cy * zoom_ / cell)) & 1;
+            }
+            base = chk ? bakeChkB8_ : bakeChkA8_;
+        }
+        int rr, gg, bb;
+        if (a == 0) {
+            rr = (int)(base & 255u); gg = (int)((base >> 8) & 255u); bb = (int)((base >> 16) & 255u);
+        } else if (a == 255) {
+            rr = r; gg = g; bb = b;
+        } else {
+            const int inv = 255 - a;
+            rr = (r * a + (int)(base & 255u) * inv + 127) / 255;
+            gg = (g * a + (int)((base >> 8) & 255u) * inv + 127) / 255;
+            bb = (b * a + (int)((base >> 16) & 255u) * inv + 127) / 255;
+        }
+        return 0xFF000000u | ((uint32_t)bb << 16) | ((uint32_t)gg << 8) | (uint32_t)rr;
+    }
+    // 网格色叠到已有颜色上(8 位整数混合)
+    inline uint32_t bakeGridOver(uint32_t c) const {
+        const int ga = bakeGridA8_, inv = 255 - ga;
+        const int r = (int)(c & 255u), g = (int)((c >> 8) & 255u), b = (int)((c >> 16) & 255u);
+        const int rr = (r * inv + (int)(bakeGrid8_ & 255u) * ga + 127) / 255;
+        const int gg = (g * inv + (int)((bakeGrid8_ >> 8) & 255u) * ga + 127) / 255;
+        const int bb = (b * inv + (int)((bakeGrid8_ >> 16) & 255u) * ga + 127) / 255;
+        return 0xFF000000u | ((uint32_t)bb << 16) | ((uint32_t)gg << 8) | (uint32_t)rr;
+    }
     inline uint32_t bakeCheckerPixel(float cx, float cy, bool inside, uint32_t v) const {
         if (!bakeChecker_) return v;
-        float br = bgR_, bg = bgG_, bb = bgB_;
-        if (inside && chkOn_) {
-            const float cell = std::max(chkTile_ * zoom_, 4.0f);
-            const int chk = ((int)std::floor(cx * zoom_ / cell) +
-                             (int)std::floor(cy * zoom_ / cell)) & 1;
-            br = chk ? chkBR_ : chkAR_;
-            bg = chk ? chkBG_ : chkAG_;
-            bb = chk ? chkBB_ : chkAB_;
-        }
-        const float a = (float)((v >> 24) & 255u) / 255.0f;
-        const float r = (float)(v & 255u) / 255.0f;
-        const float g = (float)((v >> 8) & 255u) / 255.0f;
-        const float b = (float)((v >> 16) & 255u) / 255.0f;
-        float rr = r * a + br * (1.0f - a);
-        float gg = g * a + bg * (1.0f - a);
-        float bb2 = b * a + bb * (1.0f - a);
+        uint32_t c = bakeBaseColor(cx, cy, inside, v);
         // 捏合期间网格线也烘进同一帧: 与画布/棋盘格同步, 不再靠 shader 用上一帧变换画线
-        if (inside && gridOn_ && gridA_ > 0.001f) {
-            const float gx = std::max(gridW_ * zoom_, 4.0f);
-            const float gy = std::max(gridH_ * zoom_, 4.0f);
-            if (gx >= 6.0f && gy >= 6.0f) {
-                const float sx = cx * zoom_, sy = cy * zoom_;
-                const float fx = sx - std::floor(sx / gx) * gx;
-                const float fy = sy - std::floor(sy / gy) * gy;
-                const float lw = std::max(gridLineW_, 0.5f);
-                if (fx <= lw || fy <= lw) {
-                    rr = rr * (1.0f - gridA_) + gridR_ * gridA_;
-                    gg = gg * (1.0f - gridA_) + gridG_ * gridA_;
-                    bb2 = bb2 * (1.0f - gridA_) + gridB_ * gridA_;
-                }
-            }
+        if (inside && bakeGridOn_) {
+            // 网格周期(gridW_/gridH_)也是画布单位, 同样不用除法
+            const float fxC = cx - (float)(int)(cx * bakeInvGw_) * gridW_;
+            const float fyC = cy - (float)(int)(cy * bakeInvGh_) * gridH_;
+            if (fxC <= bakeLwC_ || fyC <= bakeLwC_) c = bakeGridOver(c);
         }
-        const uint32_t rr8 = (uint32_t)std::lround(rr * 255.0f);
-        const uint32_t gg8 = (uint32_t)std::lround(gg * 255.0f);
-        const uint32_t bb8 = (uint32_t)std::lround(bb2 * 255.0f);
-        return 0xFF000000u | (bb8 << 16) | (gg8 << 8) | rr8;
+        return c;
+    }
+    // 烘帧快路径用: 网格是否在烘、格子尺寸/线宽/倒数、画布外底色
+    bool bakeActive() const { return bakeChecker_; }
+    bool bakeGridActive() const { return bakeChecker_ && bakeGridOn_; }
+    // 棋盘格单元 >=1 画布像素: 一段屏幕像素(同一画布像素)内格子不会变, 可整段填充
+    bool bakeCheckStable() const { return chkTile_ >= 1.0f; }
+    float bakeGridWC() const { return gridW_; }
+    float bakeGridHC() const { return gridH_; }
+    float bakeGridInvW() const { return bakeInvGw_; }
+    float bakeGridInvH() const { return bakeInvGh_; }
+    float bakeGridLwC() const { return bakeLwC_; }
+    uint32_t bakeBgColor() const { return 0xFF000000u | bakeBg8_; }
+    // 某一画布 x 的网格竖线相位(画布单位, 0=线中心)
+    inline float bakeGridFracX(float cx) const {
+        return cx - (float)(int)(cx * bakeInvGw_) * gridW_;
+    }
+    inline float bakeGridFracY(float cy) const {
+        return cy - (float)(int)(cy * bakeInvGh_) * gridH_;
     }
     // 放大镜窗口(屏幕像素, 含边框): 网格不再盖到镜面上, 镜内由 CPU 画放大后的网格
     void setLoupeRect(int x0, int y0, int x1, int y1) {
@@ -131,6 +184,7 @@ public:
     }
     void clearLoupeRect() { loupeOn_ = false; }
     bool gridEnabled() const { return gridOn_; }
+    bool checkerEnabled() const { return chkOn_; }
     float gridCellW() const { return gridW_; }
     float gridCellH() const { return gridH_; }
     float gridAlphaVal() const { return gridA_; }
@@ -200,6 +254,13 @@ private:
     float drawZoom_ = 1.0f, drawPanX_ = 0.0f, drawPanY_ = 0.0f, drawRot25_ = 0.0f;
     bool bakeChecker_ = false;   // 本帧是否把棋盘格烘进屏幕缓冲
     bool drawBaked_ = false;     // 已上传那一帧是否是烘入棋盘格的; draw() 据此关着色器棋盘格
+    // 烘帧热循环缓存(setBakeChecker 时按当前缩放/网格参数算好, 消除逐像素除法)
+    bool bakeGridOn_ = false;    // 网格线是否需要烘(开且格子在屏幕上 >=6px)
+    bool bakeChkFast_ = false;   // 棋盘格可用"画布单位"算(格子屏幕尺寸 >=4px)
+    float bakeInvChk_ = 1.0f, bakeInvGw_ = 1.0f, bakeInvGh_ = 1.0f;
+    float bakeLwC_ = 0.0f;       // 网格线宽(换算到画布单位)
+    uint32_t bakeBg8_ = 0, bakeChkA8_ = 0, bakeChkB8_ = 0, bakeGrid8_ = 0;
+    int bakeGridA8_ = 0;
     bool viewReady_ = false;
     bool zoomGesture_ = false;
     float zgBaseZoom_ = 1.0f, zgCanvasX_ = 0.0f, zgCanvasY_ = 0.0f;

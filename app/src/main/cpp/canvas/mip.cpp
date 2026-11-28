@@ -47,42 +47,74 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
             }
         }
     };
-    // 快路径的空 tile 快速判断(只对 L0: 每块只查 1~4 个画布 tile, 收益稳定;
+    // 快路径的空 tile/空层快速判断(只对 L0/L1: 每块只查 1~4 个画布 tile, 收益稳定;
     // 更高级别一块覆盖很多画布 tile, 密集内容时检查反而拖慢, 实测回退)。
-    if (fastCompose && !overflow && level == 0) {
-        bool any = false;
+    // 空层在这里直接从 vis 里剔除: 稀疏工程(大部分层在本 tile 没内容)不再每像素空转 N 层,
+    // 剔到只剩 1 层时还能走下面的单层直拷贝分支。
+    auto layerTouches = [&](int l, int sx0, int sy0, int sx1, int sy1) {
+        if (sx1 < 0 || sy1 < 0 || sx0 >= cw || sy0 >= ch) return false;
         const int ctx = canvas_->tilesX();
-        for (int i = 0; i < nv && !any; i++) {
-            const int l = vis[i];
-            int ox = 0, oy = 0;
-            if (d25) {
-                const int off = l * g.depth;
-                ox = (int)std::lround(g.offX * off);
-                oy = (int)std::lround(g.offY * off);
-            }
-            const int sx0 = x0 - ox, sy0 = y0 - oy;
-            const int sx1 = sx0 + (TS - 1) * stride;
-            const int sy1 = sy0 + (TS - 1) * stride;
-            if (sx1 < 0 || sy1 < 0 || sx0 >= cw || sy0 >= ch) continue;
-            const int txA = std::max(0, sx0) >> Canvas::TILE_SHIFT;
-            const int txB = std::min(cw - 1, sx1) >> Canvas::TILE_SHIFT;
-            const int tyA = std::max(0, sy0) >> Canvas::TILE_SHIFT;
-            const int tyB = std::min(ch - 1, sy1) >> Canvas::TILE_SHIFT;
-            for (int ty2 = tyA; ty2 <= tyB && !any; ty2++) {
-                for (int tx2 = txA; tx2 <= txB; tx2++) {
-                    const int ti = ty2 * ctx + tx2;
-                    if (canvas_->isSolidTile(l, ti) || canvas_->tile(l, ti)) { any = true; break; }
-                }
+        const int txA = std::max(0, sx0) >> Canvas::TILE_SHIFT;
+        const int txB = std::min(cw - 1, sx1) >> Canvas::TILE_SHIFT;
+        const int tyA = std::max(0, sy0) >> Canvas::TILE_SHIFT;
+        const int tyB = std::min(ch - 1, sy1) >> Canvas::TILE_SHIFT;
+        for (int ty2 = tyA; ty2 <= tyB; ty2++) {
+            for (int tx2 = txA; tx2 <= txB; tx2++) {
+                const int ti = ty2 * ctx + tx2;
+                if (canvas_->isSolidTile(l, ti) || canvas_->tile(l, ti)) return true;
             }
         }
-        if (!any) {
-            memset(buf.get(), 0, (size_t)TS * TS * 4);
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = tiles_.find(k);
-            if (it != tiles_.end()) return it->second.get();
-            uint32_t* p = buf.get();
-            tiles_.emplace(k, std::move(buf));
-            return p;
+        return false;
+    };
+    auto layerSrcRect = [&](int l, int* sx0, int* sy0, int* sx1, int* sy1) {
+        int ox = 0, oy = 0;
+        if (d25) {
+            const int off = l * g.depth;
+            ox = (int)std::lround(g.offX * off);
+            oy = (int)std::lround(g.offY * off);
+        }
+        *sx0 = x0 - ox; *sy0 = y0 - oy;
+        *sx1 = *sx0 + (TS - 1) * stride;
+        *sy1 = *sy0 + (TS - 1) * stride;
+    };
+    bool sparseFiltered = false;   // vis 被空层剔除过(此时不能用单层直拷贝, 见下)
+    if (fastCompose && !overflow && level <= 1) {
+        if (raster::mipSparseSkipEnabled()) {
+            int keep = 0;
+            for (int i = 0; i < nv; i++) {
+                const int l = vis[i];
+                int sx0, sy0, sx1, sy1;
+                layerSrcRect(l, &sx0, &sy0, &sx1, &sy1);
+                if (layerTouches(l, sx0, sy0, sx1, sy1)) vis[keep++] = l;
+            }
+            sparseFiltered = (keep != nv);
+            nv = keep;
+            if (nv == 0) {
+                memset(buf.get(), 0, (size_t)TS * TS * 4);
+                std::lock_guard<std::mutex> lk(mu_);
+                auto it = tiles_.find(k);
+                if (it != tiles_.end()) return it->second.get();
+                uint32_t* p = buf.get();
+                tiles_.emplace(k, std::move(buf));
+                return p;
+            }
+        } else if (level == 0) {
+            // 旧行为(调试 A/B 用): 只看"所有层都空"就 memset, 不剔除空层
+            bool any = false;
+            for (int i = 0; i < nv && !any; i++) {
+                int sx0, sy0, sx1, sy1;
+                layerSrcRect(vis[i], &sx0, &sy0, &sx1, &sy1);
+                any = layerTouches(vis[i], sx0, sy0, sx1, sy1);
+            }
+            if (!any) {
+                memset(buf.get(), 0, (size_t)TS * TS * 4);
+                std::lock_guard<std::mutex> lk(mu_);
+                auto it = tiles_.find(k);
+                if (it != tiles_.end()) return it->second.get();
+                uint32_t* p = buf.get();
+                tiles_.emplace(k, std::move(buf));
+                return p;
+            }
         }
     }
     if (overflow || !fastCompose) {
@@ -139,7 +171,10 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
                 drow[x] = acc;
             }
         }
-    } else if (nv == 1) {
+    } else if (nv == 1 && !sparseFiltered) {
+        // 只有一层可见(工程本来就只有一层): 原样拷贝。
+        // 注意: 空层剔除把可见层数降到 1 时不能走这里——逐像素合成(over)会把半透明像素
+        // 乘一次 alpha, 与 composeLayersPixelEx/导出一致; 直接拷贝会变亮。
         const int l = vis[0];
         const int ctx = canvas_->tilesX();
         for (int y = 0; y < TS; y++) {
@@ -267,6 +302,39 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                 const int ly0 = std::max(0, (y0 - by) >> level);
                 const int ly1 = std::min(TS - 1, (y1 - by) >> level);
                 if (rowFast) {
+                    // 本 mip 块内"没有内容"的层先剔除(稀疏工程免逐像素空转 N 层);
+                    // L0/L1 一块只覆盖 1~4 个画布 tile, 检查成本可忽略。
+                    int avis[64];
+                    int anv = nv;
+                    if (raster::mipSparseSkipEnabled() && level <= 1) {
+                        const int ctxv = canvas_->tilesX();
+                        const int cxA = tx << level, cyA = ty << level;
+                        const int cxB = std::min(canvas_->tilesX() - 1, ((tx + 1) << level) - 1);
+                        const int cyB = std::min(canvas_->tilesY() - 1, ((ty + 1) << level) - 1);
+                        int keep = 0;
+                        for (int i = 0; i < nv; i++) {
+                            const int l = vis[(size_t)i];
+                            bool any = false;
+                            for (int ty2 = cyA; ty2 <= cyB && !any; ty2++) {
+                                for (int tx2 = cxA; tx2 <= cxB; tx2++) {
+                                    const int ti = ty2 * ctxv + tx2;
+                                    if (canvas_->isSolidTile(l, ti) || canvas_->tile(l, ti)) {
+                                        any = true; break;
+                                    }
+                                }
+                            }
+                            if (any) avis[keep++] = l;
+                        }
+                        anv = keep;
+                    } else {
+                        for (int i = 0; i < nv; i++) avis[i] = vis[(size_t)i];
+                    }
+                    if (anv == 0) {
+                        for (int ly = ly0; ly <= ly1; ly++) {
+                            memset(t + (size_t)ly * TS + lx0, 0, (size_t)(lx1 - lx0 + 1) * 4);
+                        }
+                        continue;
+                    }
                     // 每行缓存各层 tile 指针/纯色, 避免逐像素 getPixelL 的查表;
                     // 与 MipPyramid::tile 的快路径同语义(正常混合/不透明度100%)
                     for (int ly = ly0; ly <= ly1; ly++) {
@@ -285,8 +353,8 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                             const int xt = cx >> Canvas::TILE_SHIFT;
                             if (xt != lastTx) {
                                 const int ti = tyi * ctx + xt;
-                                for (int i = 0; i < nv; i++) {
-                                    const int l = vis[(size_t)i];
+                                for (int i = 0; i < anv; i++) {
+                                    const int l = avis[(size_t)i];
                                     const bool s = canvas_->isSolidTile(l, ti);
                                     solids[(size_t)i] = s ? 1 : 0;
                                     scols[(size_t)i] = s ? canvas_->solidTileColor(l, ti) : 0;
@@ -296,7 +364,7 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                             }
                             const int off = (lyv << Canvas::TILE_SHIFT) + (cx & (Canvas::TILE - 1));
                             uint32_t acc = 0;
-                            for (int i = 0; i < nv; i++) {
+                            for (int i = 0; i < anv; i++) {
                                 const uint32_t v = solids[(size_t)i] ? scols[(size_t)i]
                                     : (ptrs[(size_t)i] ? ptrs[(size_t)i][off] : 0);
                                 if (v) raster::overPixel(acc, v);

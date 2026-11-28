@@ -2705,11 +2705,12 @@ void Engine::runDebugScript() {
             logline("mipreset");
         } else if (cmd == "updateverify") {
             // 校验 MipPyramid::updateRect 行级缓存路径: 改一块后逐像素对比原合成
+            // 8 层里只有 0/3/7 有内容 → 顺带验证"空层剔除"不改变结果
             Canvas tc;
-            tc.create(512, 512, 3);
-            for (int l = 0; l < 3; l++) {
+            tc.create(512, 512, 8);
+            for (int l : {0, 3, 7}) {
                 tc.setActive(l);
-                raster::stampCircle(tc, 100 + l * 60, 120 + l * 40, 36, 0x80FF0000u | ((uint32_t)l * 0x0000FF00u));
+                raster::stampCircle(tc, 100 + l * 20, 120 + l * 15, 36, 0x80FF0000u | ((uint32_t)l * 0x0000FF00u));
             }
             MipPyramid tm;
             tm.reset(&tc);
@@ -2718,7 +2719,7 @@ void Engine::runDebugScript() {
             raster::stampCircle(tc, 200, 200, 27, 0xFF00FF00u);
             raster::fillRect(tc, 130, 260, 90, 70, 0xD93366FFu);
             tm.updateRect(120, 130, 280, 340, 0);
-            int bad = 0, checked = 0;
+            int bad = 0, checked = 0, badTile = 0;
             for (int y = 0; y < 512; y++) {
                 for (int x = 0; x < 512; x++) {
                     const uint32_t want = raster::composeLayersPixelEx(tc, x, y, true, true, false);
@@ -2728,7 +2729,78 @@ void Engine::runDebugScript() {
                     if (got != want) bad++;
                 }
             }
-            logline("updateverify checked=" + std::to_string(checked) + " bad=" + std::to_string(bad));
+            // 再整块重建一遍(走 tile 的空层剔除+单层直拷贝), 与逐像素合成对比
+            MipPyramid tm2;
+            tm2.reset(&tc);
+            for (int ty = 0; ty < 2; ty++)
+                for (int tx = 0; tx < 2; tx++) {
+                    const uint32_t* t = tm2.tile(0, tx, ty);
+                    for (int y = 0; y < 256; y++)
+                        for (int x = 0; x < 256; x++) {
+                            const int cx = tx * 256 + x, cy = ty * 256 + y;
+                            const uint32_t want = raster::composeLayersPixelEx(tc, cx, cy, true, true, false);
+                            const uint32_t got = t ? t[((size_t)y << 8) + x] : 0;
+                            if (got != want) badTile++;
+                        }
+                }
+            // L1(2x2 采样)也走同一套空层剔除: 与逐像素合成对比
+            int badL1 = 0;
+            {
+                MipPyramid tm3;
+                tm3.reset(&tc);
+                const uint32_t* t1 = tm3.tile(1, 0, 0);
+                for (int y = 0; y < 256; y++)
+                    for (int x = 0; x < 256; x++) {
+                        const uint32_t want = raster::composeLayersPixelEx(tc, x * 2, y * 2, true, true, false);
+                        const uint32_t got = t1 ? t1[((size_t)y << 8) + x] : 0;
+                        if (got != want) badL1++;
+                    }
+            }
+            // 2.5D 叠层: 每层有位移时的空层剔除/行缓存, 与逐像素合成对比
+            int bad25 = 0;
+            {
+                auto& g25 = raster::mode25D();
+                const bool sOn = g25.on;
+                const int sDepth = g25.depth;
+                const float sYaw = g25.yawDeg;
+                g25.on = true;
+                g25.depth = 6;
+                raster::setYaw25D(0.f);
+                MipPyramid tm4;
+                tm4.reset(&tc);
+                for (int ty = 0; ty < 2; ty++)
+                    for (int tx = 0; tx < 2; tx++) {
+                        const uint32_t* t = tm4.tile(0, tx, ty);
+                        for (int y = 0; y < 256; y++)
+                            for (int x = 0; x < 256; x++) {
+                                const int cx = tx * 256 + x, cy = ty * 256 + y;
+                                const uint32_t want = raster::composeLayersPixelEx(tc, cx, cy, true, true, false);
+                                const uint32_t got = t ? t[((size_t)y << 8) + x] : 0;
+                                if (got != want) bad25++;
+                            }
+                    }
+                g25.on = sOn;
+                g25.depth = sDepth;
+                raster::setYaw25D(sYaw);
+            }
+            logline("updateverify checked=" + std::to_string(checked) + " bad=" + std::to_string(bad) +
+                    " tilebad=" + std::to_string(badTile) + " l1bad=" + std::to_string(badL1) +
+                    " d25bad=" + std::to_string(bad25));
+        } else if (cmd == "mipsparse") {
+            std::string v; ls >> v;
+            const bool on = !(v == "0" || v == "off" || v == "false");
+            raster::setMipSparseSkipEnabled(on);
+            mip_.invalidateRect(0, 0, canvas_.width() - 1, canvas_.height() - 1);
+            screenFull_ = true;
+            logline(std::string("mipsparse ") + (on ? "on" : "off"));
+        } else if (cmd == "perf") {
+            char pb[256];
+            snprintf(pb, sizeof pb, "perf fps=%d ft=%.2f maxft=%.2f comp=%.2f band=%.2f up=%.2f jk=%d dirty=%zu miptiles=%zu mipMB=%.1f",
+                     fps_.load(), lastFrameUs_.load() / 1000.0, maxFrameUs_.load() / 1000.0,
+                     compUs_.load() / 1000.0, bandUs_.load() / 1000.0, upUs_.load() / 1000.0,
+                     jank_.load(), canvas_.dirtyTiles().size(),
+                     mip_.tileCount(), mip_.bytes() / 1048576.0);
+            logline(pb);
         } else if (cmd == "fastcompose") {
             std::string v; ls >> v;
             const bool on = !(v == "0" || v == "off" || v == "false");
@@ -2739,8 +2811,140 @@ void Engine::runDebugScript() {
             plainPathOn_ = !(v == "0" || v == "off" || v == "false");
             screenFull_ = true;
             logline(std::string("plainpath ") + (plainPathOn_ ? "on" : "off"));
+        } else if (cmd == "runfill") {
+            std::string v; ls >> v;
+            runFillOn_ = !(v == "0" || v == "off" || v == "false");
+            screenFull_ = true;
+            logline(std::string("runfill ") + (runFillOn_ ? "on" : "off"));
+        } else if (cmd == "griddbg") {
+            // 只改显示层网格(不写 prefs); 测试后 griddbg off 还原
+            std::string v; ls >> v;
+            const bool on = !(v == "0" || v == "off" || v == "false");
+            display_.setOverlay(display_.checkerEnabled(), on);
+            screenFull_ = true;
+            logline(std::string("griddbg ") + (on ? "on" : "off"));
         } else if (cmd == "bench") {
             logline(runCanvasBench());
+        } else if (cmd == "mipbench") {
+            // 稀疏工程合成基准: 8 可见层里只有 3 层有内容, 对比空层剔除开/关
+            Canvas bc;
+            bc.create(1024, 1024, 8);
+            for (int l : {0, 2, 5}) {
+                bc.setActive(l);
+                for (int i = 0; i < 260; i++) {
+                    const int x = (i * 37 + l * 11) % 1000 + 12;
+                    const int y = (i * 53 + l * 17) % 1000 + 12;
+                    raster::stampCircle(bc, x, y, 7, 0xFF40A0FFu | ((uint32_t)l << 24));
+                }
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            auto buildAll = [&](bool sparse, int level) {
+                raster::setMipSparseSkipEnabled(sparse);
+                MipPyramid mp;
+                mp.reset(&bc);
+                const int nx = mp.tilesX(level), ny = mp.tilesY(level);
+                for (int ty = 0; ty < ny; ty++)
+                    for (int tx = 0; tx < nx; tx++) mp.tile(level, tx, ty);
+            };
+            buildAll(true, 0);   // 预热
+            buildAll(true, 1);
+            auto ms = [&](auto fn) {
+                const auto a = std::chrono::steady_clock::now();
+                fn();
+                return std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - a).count();
+            };
+            const double l0on = ms([&] { buildAll(true, 0); });
+            const double l0off = ms([&] { buildAll(false, 0); });
+            const double l1on = ms([&] { buildAll(true, 1); });
+            const double l1off = ms([&] { buildAll(false, 1); });
+            const double l2on = ms([&] { buildAll(true, 2); });
+            const double l2off = ms([&] { buildAll(false, 2); });
+            raster::setMipSparseSkipEnabled(true);
+            char mb[320];
+            snprintf(mb, sizeof mb, "mipbench 1024 L8/3: L0 on=%.1f/off=%.1f (%.2fx) L1 on=%.1f/off=%.1f (%.2fx) L2 on=%.1f/off=%.1f (%.2fx)",
+                     l0on, l0off, l0off / std::max(l0on, 0.001), l1on, l1off, l1off / std::max(l1on, 0.001),
+                     l2on, l2off, l2off / std::max(l2on, 0.001));
+            (void)t0;
+            logline(mb);
+        } else if (cmd == "pinchbench") {
+            // 无触摸模拟捏合帧: 进入 zoomGesture 后强制整屏重绘, 让 perf 读到 comp
+            float z = 2.0f; ls >> z;
+            display_.beginZoomGesture(540.0f, 1100.0f);
+            display_.zoomGestureTo(std::max(0.05f, z), 540.0f, 1100.0f);
+            screenFull_ = true;
+            fullBurst_ = std::max(fullBurst_, 10);
+            char pb2[128];
+            snprintf(pb2, sizeof pb2, "pinchbench z=%.2f", display_.zoom());
+            logline(pb2);
+        } else if (cmd == "pinchend") {
+            display_.endZoomGesture();
+            screenFull_ = true;
+            logline("pinchend");
+        } else if (cmd == "bakebench") {
+            // 捏合烘帧逐像素成本: 60 万像素棋盘+网格, 测新整数快路
+            display_.setBakeChecker(true);
+            const int N = 600000;
+            volatile uint32_t sink = 0;
+            const auto b0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < N; i++) {
+                const float cx = (float)(i & 511) + 0.37f;
+                const float cy = (float)((i * 7) & 511) + 0.71f;
+                const uint32_t v = (i & 3) ? 0x00000000u : 0xFF204060u;
+                sink = sink ^ display_.bakeCheckerPixel(cx, cy, true, v);
+            }
+            const double bms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - b0).count();
+            display_.setBakeChecker(false);
+            // 旧浮点实现(和 pn163 同一套公式), 同输入对比
+            const float z4 = display_.zoom();
+            const float gw4 = display_.gridCellW(), gh4 = display_.gridCellH();
+            const float ga4 = display_.gridAlphaVal();
+            const float gr4 = display_.gridRVal(), gg4 = display_.gridGVal(), gb4 = display_.gridBVal();
+            auto oldFn = [&](float cx, float cy, uint32_t v) -> uint32_t {
+                float br = 0.05f, bg = 0.067f, bb = 0.09f;
+                if (true) {
+                    const float cell = std::max(10.0f * z4, 4.0f);
+                    const int chk = ((int)std::floor(cx * z4 / cell) +
+                                     (int)std::floor(cy * z4 / cell)) & 1;
+                    br = chk ? 1.0f : 0.8f; bg = chk ? 1.0f : 0.8f; bb = chk ? 1.0f : 0.8f;
+                }
+                const int a8 = (int)((v >> 24) & 255u);
+                const float a = (float)a8 / 255.0f;
+                const float r = (float)(v & 255u) / 255.0f;
+                const float g = (float)((v >> 8) & 255u) / 255.0f;
+                const float b = (float)((v >> 16) & 255u) / 255.0f;
+                float rr = r * a + br * (1.0f - a);
+                float gg2 = g * a + bg * (1.0f - a);
+                float bb2 = b * a + bb * (1.0f - a);
+                const float gx4 = gw4 * z4, gy4 = gh4 * z4;
+                if (gx4 >= 6.0f && gy4 >= 6.0f) {
+                    const float sx4 = cx * z4, sy4 = cy * z4;
+                    const float fx4 = sx4 - std::floor(sx4 / gx4) * gx4;
+                    const float fy4 = sy4 - std::floor(sy4 / gy4) * gy4;
+                    if (fx4 <= 0.75f || fy4 <= 0.75f) {
+                        rr = rr * (1.0f - ga4) + gr4 * ga4;
+                        gg2 = gg2 * (1.0f - ga4) + gg4 * ga4;
+                        bb2 = bb2 * (1.0f - ga4) + gb4 * ga4;
+                    }
+                }
+                return 0xFF000000u | ((uint32_t)std::lround(bb2 * 255.0f) << 16) |
+                       ((uint32_t)std::lround(gg2 * 255.0f) << 8) | (uint32_t)std::lround(rr * 255.0f);
+            };
+            const auto b1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < N; i++) {
+                const float cx = (float)(i & 511) + 0.37f;
+                const float cy = (float)((i * 7) & 511) + 0.71f;
+                const uint32_t v = (i & 3) ? 0x00000000u : 0xFF204060u;
+                sink = sink ^ oldFn(cx, cy, v);
+            }
+            const double oms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - b1).count();
+            char bb2[220];
+            snprintf(bb2, sizeof bb2, "bakebench N=%d new=%.1fms(%.1fns) old=%.1fms(%.1fns) speed=%.2fx sink=%08X",
+                     N, bms, bms * 1000000.0 / N, oms, oms * 1000000.0 / N,
+                     oms / std::max(bms, 0.001), (unsigned)sink);
+            logline(bb2);
         } else if (cmd == "clear") {
             for (int l = 0; l < canvas_.layers(); l++) canvas_.clearRect(l, 0, 0, canvas_.width() - 1, canvas_.height() - 1);
             logline("clear ok");
@@ -6756,6 +6960,76 @@ void Engine::renderScreen() {
     auto renderBand = [&](int band, int bands) {
         const int syA = y0 + (rectH * band) / bands;
         const int syB = y0 + (rectH * (band + 1)) / bands - 1;
+        // 捏合烘帧 + 纯画布 + 无 2.5D 旋转 + 放大(z>=1): 屏幕上一段连续像素往往对应同一个画布像素,
+        // 按"画布像素→屏幕段"整段填充, 省掉逐屏幕像素的浮点反算/瓦片查表 + 逐像素烘棋盘。
+        // 棋盘/网格用同一套烘帧颜色(段内格子/底色不变), 像素结果与逐像素路径一致。
+        // 只在烘帧(捏合)时启用: 不烘帧时逐像素路径已经很紧, 分段反而多付边界计算。
+        if (plainCanvas && runFillOn_ && bakeChk && display_.bakeActive() &&
+            !display_.rotation25Active() && level == 0 && zoom >= 1.0f &&
+            display_.bakeCheckStable()) {
+            const bool bakeOn = bakeChk && display_.bakeActive();
+            const bool bakeGrid = bakeOn && display_.bakeGridActive();
+            const uint32_t bgCol = display_.bakeBgColor();
+            const float lwC = display_.bakeGridLwC();
+            for (int sy = syA; sy <= syB; sy++) {
+                uint32_t* drow = p + (size_t)(sy - y0) * stride;
+                float cxf = 0.f, cyf = 0.f;
+                display_.screenToCanvasF((float)x0, (float)sy, &cxf, &cyf);
+                const bool rowIn = cyf >= 0.f && cyf < (float)ch;
+                const int icy = (int)cyf;
+                if (!rowIn) {
+                    if (bakeOn) std::fill(drow, drow + rectW, bgCol);
+                    else memset(drow, 0, (size_t)rectW * 4);
+                    continue;
+                }
+                const bool rowGrid = bakeGrid && display_.bakeGridFracY(cyf) <= lwC;
+                const uint32_t* tile = nullptr;
+                int lastTx = INT_MIN;
+                int sx = x0;
+                while (sx <= x1) {
+                    const float cxs = cxf + (sx - x0) * dCx;
+                    if (cxs < 0.f) {
+                        // 画布左外侧: 整段底色
+                        int ex = std::min(x1, sx + (int)std::ceil(-cxs / dCx) - 1);
+                        if (ex < sx) ex = sx;
+                        const int n = ex - sx + 1;
+                        if (bakeOn) std::fill(drow + (sx - x0), drow + (sx - x0) + n, bgCol);
+                        else memset(drow + (sx - x0), 0, (size_t)n * 4);
+                        sx = ex + 1;
+                        continue;
+                    }
+                    const int p2 = (int)cxs;
+                    if (p2 >= cw) {
+                        const int n = x1 - sx + 1;
+                        if (bakeOn) std::fill(drow + (sx - x0), drow + (sx - x0) + n, bgCol);
+                        else memset(drow + (sx - x0), 0, (size_t)n * 4);
+                        break;
+                    }
+                    // 本画布像素在屏幕上的结束列: 先估再按逐像素同一表达式校正, 保证边界一致
+                    int ex = std::min(x1, sx + (int)std::ceil(((float)(p2 + 1) - cxs) / dCx) - 1);
+                    if (ex < sx) ex = sx;
+                    while (ex > sx && (int)(cxf + (ex - x0) * dCx) != p2) ex--;
+                    while (ex < x1 && (int)(cxf + (ex + 1 - x0) * dCx) == p2) ex++;
+                    const int tx = p2 >> 8;
+                    if (tx != lastTx) { tile = mip_.tile(0, tx, icy >> 8); lastTx = tx; }
+                    const uint32_t v = tile ? tile[((size_t)(icy & 255) << 8) + (p2 & 255)] : 0;
+                    const uint32_t base = bakeOn ? display_.bakeBaseColor(cxs, cyf, true, v) : v;
+                    const int n = ex - sx + 1;
+                    uint32_t* dst = drow + (sx - x0);
+                    if (rowGrid) {
+                        std::fill(dst, dst + n, display_.bakeGridOver(base));
+                    } else if (bakeGrid) {
+                        float fx = display_.bakeGridFracX(cxs);
+                        for (int k = 0; k < n; k++, fx += dCx)
+                            dst[k] = (fx <= lwC) ? display_.bakeGridOver(base) : base;
+                    } else {
+                        std::fill(dst, dst + n, base);
+                    }
+                    sx = ex + 1;
+                }
+            }
+            return;
+        }
         if (plainCanvas) {
             for (int sy = syA; sy <= syB; sy++) {
                 uint32_t* drow = p + (size_t)(sy - y0) * stride;
@@ -6905,14 +7179,22 @@ void Engine::renderScreen() {
             }
         }
     };
-    if ((long)rectW * rectH > 200000) pool_.run(4, [&](int i) { renderBand(i, 4); });
-    else renderBand(0, 1);
+    {
+        const auto tb0 = std::chrono::steady_clock::now();
+        if ((long)rectW * rectH > 200000) pool_.run(4, [&](int i) { renderBand(i, 4); });
+        else renderBand(0, 1);
+        bandUs_.store((int)std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - tb0).count());
+    }
     if (pfTx1 >= pfTx0 && pfTy1 >= pfTy0) {
         mip_.trim(level, pfTx0, pfTy0, pfTx1, pfTy1);
     }
     if (replayOn) {
         // 回放只画项目画布视口内的帧, 不叠加选区/网格/测距/Loupe 等编辑预览
+        const auto tu0 = std::chrono::steady_clock::now();
         const bool uploaded = display_.endUpdate();
+        upUs_.store((int)std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - tu0).count());
         const int us = (int)std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - t0).count();
         compUs_.store(us);
@@ -7177,7 +7459,10 @@ void Engine::renderScreen() {
             for (int yy = c0y; yy <= c1y; yy++) { put(c0x, yy); put(c1x, yy); }
         }
     }
+    const auto tu1 = std::chrono::steady_clock::now();
     const bool uploaded = display_.endUpdate();
+    upUs_.store((int)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - tu1).count());
     const int us = (int)std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - t0).count();
     compUs_.store(us);

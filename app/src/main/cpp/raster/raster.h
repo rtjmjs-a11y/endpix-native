@@ -45,6 +45,9 @@ uint32_t composeLayersPixelEx(const Canvas& c, int x, int y, bool showGrid, bool
 bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, bool applyCut);
 uint32_t composeLayersPixelFast(const Canvas& c, int x, int y);
 void setFastComposeEnabled(bool on);   // 调试 A/B 对比用
+// mip 构建时剔除"本块没有内容"的层(稀疏工程免逐像素空转 N 层), 调试可关做 A/B
+bool mipSparseSkipEnabled();
+void setMipSparseSkipEnabled(bool on);
 
 // 合成矩形: 目标 dst 行距 dstStride, 起点为 (x,y) 在目标缓冲中的位置
 void compositeRect(const Canvas& c, int nlayers, uint32_t* dst, int dstStride,

@@ -11,6 +11,10 @@ namespace endpix::raster {
 static std::atomic<bool> gFastCompose{true};
 void setFastComposeEnabled(bool on) { gFastCompose.store(on, std::memory_order_relaxed); }
 
+static std::atomic<bool> gMipSparseSkip{true};
+bool mipSparseSkipEnabled() { return gMipSparseSkip.load(std::memory_order_relaxed); }
+void setMipSparseSkipEnabled(bool on) { gMipSparseSkip.store(on, std::memory_order_relaxed); }
+
 
 void over8(uint8_t* d, const uint8_t* s) {
     uint8x8x4_t sv = vld4_u8(s);

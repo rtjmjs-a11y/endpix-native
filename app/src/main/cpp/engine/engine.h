@@ -453,6 +453,7 @@ private:
     bool screenFull_ = true;
     int fullBurst_ = 0;   // 尺寸/旋转后的强制整屏重绘帧数(防首帧上传失败留下空白缓冲)
     bool plainPathOn_ = true;   // 调试 A/B: 纯画布快路径
+    bool runFillOn_ = true;     // 调试 A/B: 放大时按"画布像素→屏幕段"整段填充
     std::atomic<bool> redrawReq_{false};
     std::atomic<bool> grayView_{false};   // 灰度观看(屏幕 shader), 不改像素
     // 小地图点击: 视角平滑动画(旧 PanToCanvasPixelAnimated, SmoothDamp 0.15s)
@@ -749,6 +750,7 @@ private:
     bool draining_ = false;
     std::chrono::steady_clock::time_point drainT0_;
     std::atomic<int> compUs_{0};
+    std::atomic<int> bandUs_{0}, upUs_{0};   // 调试: 整屏合成分带耗时 / AHB 上传耗时
     std::atomic<int> lastRawX_{0}, lastRawY_{0}, lastCvX_{0}, lastCvY_{0}, lastAct_{-1};
     std::atomic<int> cntDown_{0}, cntMove_{0}, cntUp_{0}, cntStamp_{0};
     std::atomic<int> prevX_{-1}, prevY_{-1}, curX_{-1}, curY_{-1}, prevDelta_{-1};
