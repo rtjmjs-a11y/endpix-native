@@ -131,12 +131,13 @@ fun ImageImportDialog() {
     LaunchedEffect(frameCount) { if (frameIdx >= frameCount) frameIdx = 0 }
 
     Dialog(
-        onDismissRequest = { },
+        onDismissRequest = { ImageImportHub.close(true) },
         properties = DialogProperties(usePlatformDefaultWidth = false,
-            dismissOnClickOutside = false, dismissOnBackPress = false)
+            dismissOnClickOutside = false, dismissOnBackPress = true)
     ) {
         Box(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 28.dp),
             contentAlignment = Alignment.Center) {
+            MotionDialogCard {
             Column(
                 Modifier.fillMaxWidth()
                     .heightIn(max = 700.dp)
@@ -369,6 +370,7 @@ fun ImageImportDialog() {
                         cb?.invoke(plan)
                     }
                 }
+            }
             }
         }
     }

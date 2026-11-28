@@ -187,11 +187,14 @@ fun CanvasTabBar(
             }
             tabs.forEach { tab ->
                 val on = tab.id == activeId
+                val tabBg by androidx.compose.animation.animateColorAsState(
+                    if (on) Ep.HighlightSel else Color.Transparent,
+                    androidx.compose.animation.core.tween(160), label = "tab-bg"
+                )
                 Row(
                     Modifier
                         .padding(horizontal = 1.dp)
-                        .background(if (on) Ep.HighlightSel else Color.Transparent,
-                            RoundedCornerShape(3.dp))
+                        .background(tabBg, RoundedCornerShape(3.dp))
                         .pointerInput(tab.id) {
                             detectTapGestures(
                                 onTap = { onSelect(tab.id) },

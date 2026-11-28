@@ -589,7 +589,9 @@ fun MainScreen(
         }
 
         // 左侧工具栏子菜单(旧 ShowToolSubmenu)
-        if (toolMenu == 4) {
+        MotionPanel(toolMenu == 4, Modifier.align(Alignment.CenterStart)
+            .padding(start = EpLayout.btn + 12.dp)
+            .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp), side = -1) {
             ShapeSubmenu(
                 shapeType = shapeType, filled = shapeFill,
                 onType = { id ->
@@ -611,9 +613,7 @@ fun MainScreen(
                     SelDrawer.open = true
                     SelDrawer.tab = 2
                 },
-                modifier = Modifier.align(Alignment.CenterStart)
-                    .padding(start = EpLayout.btn + 12.dp)
-                    .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp)
+                modifier = Modifier
             )
         }
         SelectOverlay(
@@ -667,17 +667,21 @@ fun MainScreen(
             toolYDp = toolYDp,
             modifier = Modifier.align(Alignment.CenterStart)
         )
-        if (toolMenu == 3) {
+        MotionPanel(toolMenu == 3, Modifier.align(Alignment.CenterStart)
+            .padding(start = EpLayout.btn + 12.dp)
+            .offset(y = (EpLayout.btn + EpLayout.btnGap) * (-0.5f) + toolYDp), side = -1) {
             BucketSubmenu(
                 erase = eraseMode,
                 onErase = { v -> ReplayHub.log(if (v) "油漆桶 移除像素" else "油漆桶 填充"); onEraseMode(v) },
-                modifier = Modifier.align(Alignment.CenterStart)
-                    .padding(start = EpLayout.btn + 12.dp)
-                    .offset(y = (EpLayout.btn + EpLayout.btnGap) * (-0.5f) + toolYDp)
+                modifier = Modifier
             )
         }
-        if (toolMenu == 0 || toolMenu == 2) {
-            val pen = toolMenu == 0
+        val penSub = tool == 0
+        MotionPanel(toolMenu == 0 || toolMenu == 2, Modifier.align(Alignment.CenterStart)
+            .padding(start = EpLayout.btn + 12.dp)
+            .offset(y = (EpLayout.btn + EpLayout.btnGap) * (if (penSub) -2.5f else -1.5f) + toolYDp),
+            side = -1) {
+            val pen = penSub
             PenSubmenu(
                 isPen = pen, color = brushColor,
                 px = if (pen) brushPx else eraserPx,
@@ -695,9 +699,7 @@ fun MainScreen(
                 onAlphaLock = { v -> ReplayHub.log(if (v) "本层蒙版 开" else "本层蒙版 关"); onAlphaLock(v) },
                 buildup = buildup,
                 onBuildup = { v -> ReplayHub.log(if (v) "叠色 开" else "叠色 关"); onBuildup(v) },
-                modifier = Modifier.align(Alignment.CenterStart)
-                    .padding(start = EpLayout.btn + 12.dp)
-                    .offset(y = (EpLayout.btn + EpLayout.btnGap) * (if (pen) -2.5f else -1.5f) + toolYDp)
+                modifier = Modifier
             )
         }
 
@@ -706,10 +708,11 @@ fun MainScreen(
         if (colorMenu && !showHsv) {
             toolMenu = -1
             // 6/18 色菜单跟着选中行居中; 32 色是滚动盘, 菜单固定屏幕中间避免跑到可视区外
+            MotionPanel(true, Modifier.align(Alignment.CenterEnd)
+                .padding(end = EpLayout.swatch + 10.dp)
+                .offset(y = ToolPaletteLayout.colorMenuY(visPalette.size, selIdx)), side = 1) {
             ColorOptionsMenu(
-                modifier = Modifier.align(Alignment.CenterEnd)
-                    .padding(end = EpLayout.swatch + 10.dp)
-                    .offset(y = ToolPaletteLayout.colorMenuY(visPalette.size, selIdx)),
+                modifier = Modifier,
                 onPick = { colorMenu = false; onDeselect(); onPickRequested(); ReplayHub.log("取色器") },
                 onMix = {
                     colorMenu = false
@@ -720,6 +723,7 @@ fun MainScreen(
                 },
                 onHsv = { colorMenu = false; onDeselect(); onCancelPick(); hsvStartMode = 0; showHsv = true; ReplayHub.log("打开 HSV") },
             )
+            }
         }
 
         // 长按色板: 色格数量(6–60) + 槽位编辑 + 调色板预设管理
@@ -761,14 +765,22 @@ fun MainScreen(
         // 测距读数 + 起/中/终标签: 数据来自 60Hz 轻量轮询(measUi), 跟手不卡
         MeasureOverlay(measUi = measUi, measureFixed = measureFixed, measurePending = measurePending)
 
-        if (subToast.isNotEmpty()) {
-            LaunchedEffect(subToast) { kotlinx.coroutines.delay(1800); subToast = "" }
+        var lastToast by remember { mutableStateOf("") }
+        LaunchedEffect(subToast) {
+            if (subToast.isNotEmpty()) {
+                lastToast = subToast
+                kotlinx.coroutines.delay(1800)
+                subToast = ""
+            }
+        }
+        MotionPanel(subToast.isNotEmpty(), Modifier.align(Alignment.BottomCenter)
+            .padding(bottom = 250.dp), side = 0) {
             Box(
-                Modifier.align(Alignment.BottomCenter).padding(bottom = 250.dp)
+                Modifier
                     .background(Color(0xE6161B22), RoundedCornerShape(3.dp))
                     .border(1.dp, Ep.Line, RoundedCornerShape(3.dp))
                     .padding(horizontal = 14.dp, vertical = 8.dp)
-            ) { Text(subToast, color = Ep.Text, fontSize = 11.sp) }
+            ) { Text(lastToast, color = Ep.Text, fontSize = 11.sp) }
         }
 
         if (lcToast) {
@@ -816,8 +828,10 @@ fun MainScreen(
             onConfirm = { ReplayHub.log("确认选区"); onConfirmSel() }
         )
         // 方形/圆形渐变: 拖出形状后显示简化预设 + 应用/取消(裁剪状态)
-        GradientPanel(Modifier.align(Alignment.BottomCenter))
-        if (minimapOn && !showTimeline) {
+        MotionPanel(GradHub.active, Modifier.align(Alignment.BottomCenter), side = 0) {
+            GradientPanel(Modifier)
+        }
+        MotionPanel(minimapOn && !showTimeline, side = 0) {
             MinimapPanel(
                 frameIdx = frameIdx, activeLayer = activeLayer, version = thumbRev,
                 frameThumb = frameThumb, minimapThumb = minimapThumb, compositeThumb = compositeThumb,
@@ -830,7 +844,7 @@ fun MainScreen(
                 viewportProvider = minimapViewport
             )
         }
-        if (refOn && !showTimeline) {
+        MotionPanel(refOn && !showTimeline, side = 0) {
             ReferencePanel(
                 bitmap = refBitmap, scale = refScale, xDp = refX, yDp = refY,
                 onScale = onRefScale, onPos = onRefPos, onPickImage = onPickRefImage,
@@ -865,9 +879,9 @@ fun MainScreen(
         )
 
         // 抽屉面板(颜色调整/像素描边): 横向从设置列到时间轴列, 底边压在"单指移动"那一排上面
-        if (SelDrawer.open) {
+        MotionPanel(SelDrawer.open, Modifier.align(Alignment.BottomCenter), side = 0) {
             SelectionDrawer(
-                modifier = Modifier.align(Alignment.BottomCenter)
+                modifier = Modifier
                     .padding(start = EpLayout.edge, end = EpLayout.edge,
                         bottom = EpLayout.bottomY1 + EpLayout.btn + 6.dp),
                 selActive = selActive, brushColor = brushColor, onBrushColor = onColor,
@@ -883,27 +897,30 @@ fun MainScreen(
         )
 
         // 测距模式面板(旧 Measure.cs): 主动设置起点/中心设置起点/回到手指起点
-        if (tool == 4 && shapeType == 6 && !showTimeline) {
+        MotionPanel(tool == 4 && shapeType == 6 && !showTimeline,
+            Modifier.align(Alignment.BottomCenter), side = 0) {
             MeasurePanelHost(
                 measUi = measUi,
                 fixed = measureFixed, pending = measurePending,
                 onSetStart = onMeasureSetStart,
                 onCenter = onMeasureCenterStart,
                 onFinger = onMeasureFingerStart,
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 150.dp)
+                modifier = Modifier.padding(bottom = 150.dp)
             )
         }
         // 多边形套索浮条(旧 pm615 顶部浮条): 撤销点/重置点/完成/取消
-        if (tool == 4 && shapeType == 7 && !showTimeline) {
+        MotionPanel(tool == 4 && shapeType == 7 && !showTimeline,
+            Modifier.align(Alignment.TopCenter), side = 0) {
             PolyBar(
                 verts = polyVerts,
                 onUndo = onPolyUndo, onReset = onPolyReset,
                 onFinish = onPolyFinish, onCancel = onPolyCancel,
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 72.dp)
+                modifier = Modifier.padding(top = 72.dp)
             )
         }
 
-        if (showSettingsMenu) {
+        MotionPanel(showSettingsMenu, Modifier.align(Alignment.BottomStart)
+            .padding(start = EpLayout.edge + EpLayout.btn + 6.dp, bottom = EpLayout.bottomY2), side = 0) {
             SettingsMenu(
                 onSaveProject = { showSettingsMenu = false; onSaveNow() },
                 onExportPng = { showSettingsMenu = false; showExportPngDialog = true },
@@ -916,12 +933,11 @@ fun MainScreen(
                 onCreateCanvas = { showSettingsMenu = false; StudioHub.mode = 0 },
                 onResizeCanvas = { showSettingsMenu = false; StudioHub.mode = 1 },
                 onAdjustSettings = { showSettingsMenu = false; showSettings = true },
-                modifier = Modifier.align(Alignment.BottomStart)
-                    .padding(start = EpLayout.edge + EpLayout.btn + 6.dp, bottom = EpLayout.bottomY2)
+                modifier = Modifier
             )
         }
 
-        if (showTimeline) {
+        MotionPanel(showTimeline, Modifier.fillMaxSize(), side = 0) {
             TimelinePanel2(
                 layers = layers, active = activeLayer,
                 frameIdx = frameIdx, frameCount = frameCount, playing = playing,
@@ -1063,7 +1079,7 @@ fun MainScreen(
                 )
             }
         }
-        if (showHsv) {
+        MotionPanel(showHsv, Modifier.fillMaxSize(), side = 0) {
             HsvDialog(
                 current = (brushColor and 0x00FFFFFF) or (brushAlpha shl 24),
                 onColor = { c -> ReplayHub.log("HSV 调色"); onHsvColor(c) },
@@ -1756,13 +1772,16 @@ private fun ToolColumn(
     Column(modifier.width(EpLayout.btn), verticalArrangement = Arrangement.spacedBy(EpLayout.btnGap)) {
         TOOLS.forEach { t ->
             val active = t.id == tool
+            val src = remember(t.id) { androidx.compose.foundation.interaction.MutableInteractionSource() }
+            val bg by androidx.compose.animation.animateColorAsState(
+                if (active) Ep.HighlightSel else Ep.Panel2,
+                androidx.compose.animation.core.tween(160), label = "tool-bg"
+            )
             Box(
                 Modifier.size(EpLayout.btn)
-                    .background(
-                        if (active) Ep.HighlightSel else Ep.Panel2,
-                        RoundedCornerShape(3.dp)
-                    )
-                    .clickable(enabled = t.enabled) { onTool(t.id) },
+                    .background(bg, RoundedCornerShape(3.dp))
+                    .clickable(interactionSource = src, indication = null, enabled = t.enabled) { onTool(t.id) }
+                    .pressScale(src),
                 contentAlignment = Alignment.Center
             ) {
                 if (t.id == 4) {
@@ -1841,18 +1860,22 @@ private fun ColorColumn(
         colors.forEachIndexed { i, c ->
             val selected = i == selectedIdx
             val shown = if (selected) brushColor else c
+            val src = remember(i) { androidx.compose.foundation.interaction.MutableInteractionSource() }
+            val border by androidx.compose.animation.animateColorAsState(
+                if (selected) Color.White else Ep.Line,
+                androidx.compose.animation.core.tween(140), label = "swatch-border"
+            )
             Box(
                 Modifier.width(EpLayout.swatch).height(cellH)
                     .background(Color(shown))
-                    .border(
-                        2.dp,
-                        if (selected) Color.White else Ep.Line,
-                        RoundedCornerShape(2.dp)
-                    )
+                    .border(2.dp, border, RoundedCornerShape(2.dp))
                     .combinedClickable(
+                        interactionSource = src,
+                        indication = null,
                         onClick = { if (selected) onSelectedTap() else onColor(i, c) },
                         onLongClick = onLongPress,
                     )
+                    .pressScale(src, pressedScale = 0.92f)
             )
         }
     }
@@ -1902,10 +1925,16 @@ private fun stepBadge(n: Int): String = if (n > 99) "99+" else n.toString()
 @Composable
 private fun BottomIcon(icon: Int, modifier: Modifier = Modifier, onClick: () -> Unit,
                        active: Boolean = false, badge: String? = null) {
+    val src = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val bg by androidx.compose.animation.animateColorAsState(
+        if (active) Ep.HighlightSel else Ep.Panel2,
+        androidx.compose.animation.core.tween(160), label = "bottom-bg"
+    )
     Box(
         modifier.size(EpLayout.btn)
-            .background(if (active) Ep.HighlightSel else Ep.Panel2, RoundedCornerShape(3.dp))
-            .clickable { onClick() },
+            .background(bg, RoundedCornerShape(3.dp))
+            .clickable(interactionSource = src, indication = null) { onClick() }
+            .pressScale(src),
         contentAlignment = Alignment.Center
     ) {
         EpIcon(icon, if (active) Color.Black else Color.White, size = 22.dp)
@@ -3087,9 +3116,10 @@ private fun SelectOverlay(
     onToast: (String) -> Unit, onClose: () -> Unit,
     toolYDp: Dp, modifier: Modifier = Modifier,
 ) {
-    if (!show) return
     // 只有正在框选且已成功裁剪(浮起)的目标才能用裁剪导出/新标签打开
     val cropReady = com.endpix.nativeapp.ui.CropExportHub.targetReady
+    MotionPanel(show, modifier.padding(start = EpLayout.btn + 12.dp)
+        .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp), side = -1) {
     SelectSubmenu(
         mode = mode,
         onMode = { m -> ReplayHub.log("选区模式 $m"); onMode(m) },
@@ -3127,9 +3157,9 @@ private fun SelectOverlay(
             if (!cropReady) onToast("需要正在框选且已裁剪的目标")
             else { onClose(); ReplayHub.log("新标签打开裁剪"); com.endpix.nativeapp.ui.CropExportHub.newTab() }
         },
-        modifier = modifier.padding(start = EpLayout.btn + 12.dp)
-            .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp)
+        modifier = Modifier
     )
+    }
 }
 
 // 通用更多工具（同样从 MainScreen 拆出）
@@ -3148,7 +3178,8 @@ private fun MoreToolsOverlay(
     onText: () -> Unit, onClose: () -> Unit,
     toolYDp: Dp, modifier: Modifier = Modifier,
 ) {
-    if (!show) return
+    MotionPanel(show, modifier.padding(start = EpLayout.btn + 12.dp)
+        .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp), side = -1) {
     MoreToolsMenu(
         portraitLock = portraitLock, onPortraitLock = onPortraitLock,
         recordOn = recordOn, recordCount = recordCount,
@@ -3169,7 +3200,7 @@ private fun MoreToolsOverlay(
         gridOn = gridOn, onGrid = onGrid,
         noiseOn = noiseOn, onNoisePanel = { ReplayHub.log("打开白噪音"); onNoisePanel(); onClose() },
         onText = { ReplayHub.log("打开添加文字"); onText(); onClose() },
-        modifier = modifier.padding(start = EpLayout.btn + 12.dp)
-            .offset(y = (EpLayout.btn + EpLayout.btnGap) * 0.5f + toolYDp)
+        modifier = Modifier
     )
+    }
 }

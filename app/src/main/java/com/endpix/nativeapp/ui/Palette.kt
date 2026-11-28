@@ -231,6 +231,7 @@ fun PaletteDialog(
     }
 
     Dialog(onDismissRequest = { }) {
+        MotionDialogCard {
         Column(
             Modifier.width(340.dp).heightIn(max = 620.dp)
                 .background(Ep.Panel, RoundedCornerShape(6.dp))
@@ -437,6 +438,7 @@ fun PaletteDialog(
                 Text("预设记住自己的色数；导入支持旧版导出的文本格式。",
                     color = Ep.Sub, fontSize = 8.sp, lineHeight = 11.sp)
             }
+        }
         }
     }
 }

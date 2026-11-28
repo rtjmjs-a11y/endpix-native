@@ -77,6 +77,7 @@ fun ExportPngDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        MotionDialogCard {
         Column(Modifier.fillMaxSize().navigationBarsPadding()) {
             // ---- 预览区(上 42%) ----
             Box(Modifier.weight(0.36f).fillMaxWidth().background(Color(0xFF1E1E1E))) {
@@ -406,6 +407,7 @@ fun ExportPngDialog(
                     Spacer(Modifier.weight(1f))
                 }
             }
+        }
         }
     }
 }

@@ -83,9 +83,10 @@ fun SliceImportDialog() {
     val counts = heights.map { (it / fh).coerceAtLeast(1) }
     val totalFrames = counts.maxOrNull() ?: 1
     Dialog(
-        onDismissRequest = { },
-        properties = DialogProperties(dismissOnClickOutside = false, dismissOnBackPress = false)
+        onDismissRequest = { SliceImportHub.close(true) },
+        properties = DialogProperties(dismissOnClickOutside = false, dismissOnBackPress = true)
     ) {
+        MotionDialogCard {
         Column(
             Modifier.width(310.dp)
                 .background(Ep.Panel, RoundedCornerShape(6.dp))
@@ -137,6 +138,7 @@ fun SliceImportDialog() {
                     cb?.invoke(fh)
                 }
             }
+        }
         }
     }
 }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -23,11 +24,23 @@ fun SquareBtn(
     selected: Boolean = false,
     dim: Boolean = false,
 ) {
+    val src = androidx.compose.runtime.remember {
+        androidx.compose.foundation.interaction.MutableInteractionSource()
+    }
+    val bg by androidx.compose.animation.animateColorAsState(
+        if (selected) Ep.HighlightSel else Ep.Panel2,
+        androidx.compose.animation.core.tween(150), label = "sq-bg"
+    )
+    val line by androidx.compose.animation.animateColorAsState(
+        if (selected) Ep.Accent else Ep.Line,
+        androidx.compose.animation.core.tween(150), label = "sq-line"
+    )
     Column(
         modifier.size(38.dp)
-            .background(if (selected) Ep.HighlightSel else Ep.Panel2, RoundedCornerShape(4.dp))
-            .border(1.dp, if (selected) Ep.Accent else Ep.Line, RoundedCornerShape(4.dp))
-            .clickable(interactionSource = null, indication = null) { onClick() },
+            .background(bg, RoundedCornerShape(4.dp))
+            .border(1.dp, line, RoundedCornerShape(4.dp))
+            .clickable(interactionSource = src, indication = null) { onClick() }
+            .pressScale(src, pressedScale = 0.92f),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
