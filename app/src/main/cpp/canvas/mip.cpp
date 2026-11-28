@@ -277,6 +277,16 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
     const raster::Mode25D& g25 = raster::mode25D();
     const bool d25 = g25.on && g25.depth > 0 && nl > 1;
     const bool rowFast = fastCompose && !d25 && nv > 0 && !visOverflow;
+    const bool rowD25 = fastCompose && d25 && nv > 0 && !visOverflow;
+    // 2.5D: 每层错位量先算好(与 tile()/composeLayersPixelFast 同一 round 语义)
+    int oxAll[64], oyAll[64];
+    if (d25) {
+        for (int i = 0; i < nv; i++) {
+            const int off = vis[(size_t)i] * g25.depth;
+            oxAll[i] = (int)std::lround(g25.offX * off);
+            oyAll[i] = (int)std::lround(g25.offY * off);
+        }
+    }
     const int ctx = canvas_->tilesX();
     const uint32_t* ptrs[64];
     uint32_t scols[64];
@@ -367,6 +377,97 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                             for (int i = 0; i < anv; i++) {
                                 const uint32_t v = solids[(size_t)i] ? scols[(size_t)i]
                                     : (ptrs[(size_t)i] ? ptrs[(size_t)i][off] : 0);
+                                if (v) raster::overPixel(acc, v);
+                            }
+                            trow[lx] = acc;
+                        }
+                    }
+                } else if (rowD25) {
+                    // 2.5D: 每层错位是固定的, 按行缓存各层 tile 指针(与 tile() 的 d25 分支同构),
+                    // 不再逐像素 composeLayersPixelFast 里每层算 offset/边界。
+                    int avis[64], aox[64], aoy[64];
+                    int anv = nv;
+                    if (raster::mipSparseSkipEnabled() && level <= 1) {
+                        const int ctxv = canvas_->tilesX();
+                        int keep = 0;
+                        for (int i = 0; i < nv; i++) {
+                            const int sx0 = tx * span - oxAll[i];
+                            const int sy0 = ty * span - oyAll[i];
+                            const int sx1 = sx0 + span - 1, sy1 = sy0 + span - 1;
+                            if (sx1 < 0 || sy1 < 0 || sx0 >= cw || sy0 >= ch) continue;
+                            const int txA = std::max(0, sx0) >> Canvas::TILE_SHIFT;
+                            const int txB = std::min(cw - 1, sx1) >> Canvas::TILE_SHIFT;
+                            const int tyA = std::max(0, sy0) >> Canvas::TILE_SHIFT;
+                            const int tyB = std::min(ch - 1, sy1) >> Canvas::TILE_SHIFT;
+                            bool any = false;
+                            for (int ty2 = tyA; ty2 <= tyB && !any; ty2++) {
+                                for (int tx2 = txA; tx2 <= txB; tx2++) {
+                                    const int ti = ty2 * ctxv + tx2;
+                                    if (canvas_->isSolidTile(vis[(size_t)i], ti) ||
+                                        canvas_->tile(vis[(size_t)i], ti)) { any = true; break; }
+                                }
+                            }
+                            if (any) {
+                                avis[keep] = vis[(size_t)i];
+                                aox[keep] = oxAll[i];
+                                aoy[keep] = oyAll[i];
+                                keep++;
+                            }
+                        }
+                        anv = keep;
+                    } else {
+                        for (int i = 0; i < nv; i++) {
+                            avis[i] = vis[(size_t)i];
+                            aox[i] = oxAll[i];
+                            aoy[i] = oyAll[i];
+                        }
+                    }
+                    if (anv == 0) {
+                        for (int ly = ly0; ly <= ly1; ly++) {
+                            memset(t + (size_t)ly * TS + lx0, 0, (size_t)(lx1 - lx0 + 1) * 4);
+                        }
+                        continue;
+                    }
+                    uint8_t rowOk[64];
+                    int tyi25[64], lyv25[64], lastTx25[64];
+                    for (int ly = ly0; ly <= ly1; ly++) {
+                        const int cy = by + (ly << level);
+                        uint32_t* trow = t + (size_t)ly * TS;
+                        if (cy >= ch) {
+                            memset(trow + lx0, 0, (size_t)(lx1 - lx0 + 1) * 4);
+                            continue;
+                        }
+                        for (int i = 0; i < anv; i++) {
+                            const int sy = cy - aoy[i];
+                            rowOk[i] = (sy >= 0 && sy < ch) ? 1 : 0;
+                            if (rowOk[i]) {
+                                tyi25[i] = sy >> Canvas::TILE_SHIFT;
+                                lyv25[i] = sy & (Canvas::TILE - 1);
+                                lastTx25[i] = -1;
+                            }
+                        }
+                        for (int lx = lx0; lx <= lx1; lx++) {
+                            const int cx = bx + (lx << level);
+                            if (cx >= cw) { trow[lx] = 0; continue; }
+                            uint32_t acc = 0;
+                            for (int i = 0; i < anv; i++) {
+                                if (!rowOk[i]) continue;
+                                const int sx = cx - aox[i];
+                                if (sx < 0 || sx >= cw) continue;
+                                const int tx2 = sx >> Canvas::TILE_SHIFT;
+                                if (tx2 != lastTx25[i]) {
+                                    const int ti = tyi25[i] * ctx + tx2;
+                                    const int l = avis[i];
+                                    const bool s = canvas_->isSolidTile(l, ti);
+                                    solids[(size_t)i] = s ? 1 : 0;
+                                    scols[(size_t)i] = s ? canvas_->solidTileColor(l, ti) : 0;
+                                    ptrs[(size_t)i] = s ? nullptr : canvas_->tile(l, ti);
+                                    lastTx25[i] = tx2;
+                                }
+                                const uint32_t v = solids[(size_t)i] ? scols[(size_t)i]
+                                    : (ptrs[(size_t)i] ? ptrs[(size_t)i]
+                                        [((size_t)lyv25[i] << Canvas::TILE_SHIFT) +
+                                         (sx & (Canvas::TILE - 1))] : 0);
                                 if (v) raster::overPixel(acc, v);
                             }
                             trow[lx] = acc;

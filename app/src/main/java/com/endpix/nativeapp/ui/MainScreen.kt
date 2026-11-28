@@ -181,7 +181,7 @@ fun MainScreen(
     onBuildup: (Boolean) -> Unit = {},
     batteryPct: Int,
     charging: Boolean,
-    memPct: Int,
+    memPct: Int = -1,   // 已改走 StatsHub(避免 2s 一次整屏重组), 旧参数保留默认值
     portraitLock: Boolean,
     onPortraitLock: (Boolean) -> Unit,
     selRect: androidx.compose.runtime.State<IntArray>,
@@ -477,10 +477,7 @@ fun MainScreen(
                 .padding(start = perfStart, top = perfTop)
         )
         InfoPanel(
-            ui, left = false, memPct = memPct, panelW = perfPanelW,
-            autoSaveMin = autoSaveMin,
-            autoSaveRemain = autoSaveRemain,
-            autoSaveSaving = autoSaveSaving,
+            ui, left = false, panelW = perfPanelW,
             modifier = Modifier.align(Alignment.TopEnd)
                 .padding(end = perfStart, top = perfTop)
         )
@@ -1194,9 +1191,8 @@ private fun parseStats(s: String): UiStats {
 @Composable
 private fun InfoPanel(
     ui: UiStats, left: Boolean, modifier: Modifier = Modifier,
-    batteryPct: Int = -1, charging: Boolean = false, memPct: Int = -1,
+    batteryPct: Int = -1, charging: Boolean = false,
     panelW: androidx.compose.ui.unit.Dp = EpLayout.infoW,
-    autoSaveMin: Int = 0, autoSaveRemain: Int = -1, autoSaveSaving: Boolean = false,
 ) {
     if (ReplayHub.visible) return
     if (TopBarPrefs.hidePerf) return
@@ -1218,18 +1214,24 @@ private fun InfoPanel(
             Brush.linearGradient(listOf(solid, clear), Offset(0f, 0f), Offset(size.width, size.height))
         drawRect(brush)
     }
-    // 旧 pm1053: 三行手工定位(行高 10u≈7.8dp, 字号 11u), 关掉等距布局避免第三行被顶出背景
-    val memTxt = if (memPct in 0..100) "内存:${memPct}%" else "内存:--"
-    val saveTxt = when {
-        autoSaveMin <= 0 -> "自动保存 关"
-        autoSaveSaving -> "自动保存 保存中"
-        autoSaveRemain < 0 -> "自动保存 --:--"
-        else -> "自动保存 ${autoSaveRemain / 60}:${(autoSaveRemain % 60).toString().padStart(2, '0')}"
-    }
+    // 右栏这三个值每 1~2 秒就变: 在这里读 StatsHub, 重组只限于这块小面板,
+    // 不再通过 MainScreen 参数把整屏拖进重组(空闲 UI 线程 CPU 从 ~20% 降下来)。
     val lines = if (left)
         listOf(ui.canvas, "帧${ui.frIdx}/${ui.frCount} ${ui.layers} ${ui.zoom}", time.value)
-    else
-        listOf("${ui.fps} $memTxt", "合成:${ui.comp}ms 正常", saveTxt)
+    else {
+        val memPct = StatsHub.memPct
+        val autoSaveMin = StatsHub.autoSaveMin
+        val autoSaveSaving = StatsHub.autoSaveSaving
+        val autoSaveRemain = StatsHub.autoSaveRemain
+        val memTxt = if (memPct in 0..100) "内存:${memPct}%" else "内存:--"
+        val saveTxt = when {
+            autoSaveMin <= 0 -> "自动保存 关"
+            autoSaveSaving -> "自动保存 保存中"
+            autoSaveRemain < 0 -> "自动保存 --:--"
+            else -> "自动保存 ${autoSaveRemain / 60}:${(autoSaveRemain % 60).toString().padStart(2, '0')}"
+        }
+        listOf("${StatsHub.fpsText} $memTxt", "合成:${StatsHub.compText}ms 正常", saveTxt)
+    }
     Box(modifier.width(panelW).height(EpLayout.infoH).then(grad)) {
         lines.forEachIndexed { i, txt ->
             Text(

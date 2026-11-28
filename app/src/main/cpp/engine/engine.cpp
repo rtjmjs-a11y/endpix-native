@@ -2795,6 +2795,28 @@ void Engine::runDebugScript() {
                 LOGI("psdasync result: %s", r.c_str());
             });
             logline("psdasync queued");
+        } else if (cmd == "shapeprevtest") {
+            // 形状预览批量写入/还原自测: 在同位置涂一小块再还原, 对比原像素
+            const int l = canvas_.active();
+            const int ax = 16, ay = 16, bx = 24, by = 24;
+            std::vector<uint32_t> before;
+            for (int y = ay; y <= by; y++)
+                for (int x = ax; x <= bx; x++) before.push_back(canvas_.getPixelL(l, x, y));
+            shapePrevBegin();
+            std::vector<int> xy;
+            for (int y = ay; y <= by; y++)
+                for (int x = ax; x <= bx; x++) { xy.push_back(x); xy.push_back(y); }
+            shapePrevPaint(xy, 0x80FF00FFu, l);
+            const uint32_t painted = canvas_.getPixelL(l, (ax + bx) / 2, (ay + by) / 2);
+            shapePrevRestore();
+            int diff = 0;
+            size_t k = 0;
+            for (int y = ay; y <= by; y++)
+                for (int x = ax; x <= bx; x++, k++)
+                    if (canvas_.getPixelL(l, x, y) != before[k]) diff++;
+            char sb[160];
+            snprintf(sb, sizeof sb, "shapeprevtest n=%zu diff=%d painted=%08X", before.size(), diff, painted);
+            logline(sb);
         } else if (cmd == "compose") {
             int x, y; ls >> x >> y;
             char b[128];
@@ -2871,7 +2893,7 @@ void Engine::runDebugScript() {
                     }
             }
             // 2.5D 叠层: 每层有位移时的空层剔除/行缓存, 与逐像素合成对比
-            int bad25 = 0;
+            int bad25 = 0, bad25u = 0;
             {
                 auto& g25 = raster::mode25D();
                 const bool sOn = g25.on;
@@ -2893,13 +2915,28 @@ void Engine::runDebugScript() {
                                 if (got != want) bad25++;
                             }
                     }
+                // updateRect 的 2.5D 行缓存分支: 改一块后再次逐像素对比(按生产路径扩 pad)
+                raster::stampCircle(tc, 300, 300, 24, 0xFF00FFFFu);
+                const int pad25 = (tc.layers() - 1) * 6;
+                tm4.updateRect(260 - pad25, 260 - pad25, 340 + pad25, 340 + pad25, 0);
+                for (int ty = 0; ty < 2; ty++)
+                    for (int tx = 0; tx < 2; tx++) {
+                        const uint32_t* t = tm4.tile(0, tx, ty);
+                        for (int y = 0; y < 256; y++)
+                            for (int x = 0; x < 256; x++) {
+                                const int cx = tx * 256 + x, cy = ty * 256 + y;
+                                const uint32_t want = raster::composeLayersPixelEx(tc, cx, cy, true, true, false);
+                                const uint32_t got = t ? t[((size_t)y << 8) + x] : 0;
+                                if (got != want) bad25u++;
+                            }
+                    }
                 g25.on = sOn;
                 g25.depth = sDepth;
                 raster::setYaw25D(sYaw);
             }
             logline("updateverify checked=" + std::to_string(checked) + " bad=" + std::to_string(bad) +
                     " tilebad=" + std::to_string(badTile) + " l1bad=" + std::to_string(badL1) +
-                    " d25bad=" + std::to_string(bad25));
+                    " d25bad=" + std::to_string(bad25) + " d25ubad=" + std::to_string(bad25u));
         } else if (cmd == "mipsparse") {
             std::string v; ls >> v;
             const bool on = !(v == "0" || v == "off" || v == "false");
@@ -5585,7 +5622,8 @@ void Engine::loop() {
                 job = std::move(pngJob_);
             }
             if (job) {
-                if (job->step(canvas_, 20)) {
+                // 每帧最多 6ms(旧值 20ms 会让导出期间掉到 ~50fps 并触发 jank)
+                if (job->step(canvas_, 6)) {
                     ExportResult er = job->result();
                     char eb[256];
                     if (er.ok) snprintf(eb, sizeof eb, "ok %dx%d bytes=%lld ms=%ld", er.w, er.h, er.bytes, er.ms);
@@ -5723,12 +5761,19 @@ void Engine::shapePrevRestore() {
     if (shPrevIdx_.empty()) { shPrevLayer_ = -1; return; }
     const int layer = shPrevLayer_ >= 0 ? shPrevLayer_ : canvas_.active();
     const int cw = canvas_.width(), ch = canvas_.height();
+    const int ctx = canvas_.tilesX();
+    int lastTi = -1;
+    uint32_t* tp = nullptr;
     int bx0 = INT_MAX, by0 = INT_MAX, bx1 = INT_MIN, by1 = INT_MIN;
     for (size_t i = 0; i < shPrevIdx_.size(); i++) {
         const int id = shPrevIdx_[i];
         const int x = id % cw, y = id / cw;
         if ((unsigned)x >= (unsigned)cw || (unsigned)y >= (unsigned)ch) continue;
-        canvas_.setPixelL(layer, x, y, shPrevOld_[i]);
+        // 按 tile 缓存写入指针: 逐像素 setPixelL 会重复做 tile 查找
+        const int ti = (y >> Canvas::TILE_SHIFT) * ctx + (x >> Canvas::TILE_SHIFT);
+        if (ti != lastTi) { tp = canvas_.tileForWrite(layer, ti); lastTi = ti; }
+        tp[((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+           (x & (Canvas::TILE - 1))] = shPrevOld_[i];
         bx0 = std::min(bx0, x); bx1 = std::max(bx1, x);
         by0 = std::min(by0, y); by1 = std::max(by1, y);
     }
@@ -5758,12 +5803,22 @@ void Engine::shapePrevPaint(const std::vector<int>& xy, uint32_t color, int laye
     std::sort(idx.begin(), idx.end());
     idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
     shPrevLayer_ = layer;
+    const int ctx = canvas_.tilesX();
+    const bool lock = canvas_.alphaLock();
+    int lastTi = -1;
+    uint32_t* tp = nullptr;
     int bx0 = INT_MAX, by0 = INT_MAX, bx1 = INT_MIN, by1 = INT_MIN;
     for (int id : idx) {
         const int x = id % cw, y = id / cw;
+        const int ti = (y >> Canvas::TILE_SHIFT) * ctx + (x >> Canvas::TILE_SHIFT);
+        if (ti != lastTi) { tp = canvas_.tileForWrite(layer, ti); lastTi = ti; }
+        const size_t off = ((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+                           (x & (Canvas::TILE - 1));
+        const uint32_t old = tp[off];
+        if (lock && !(old >> 24)) continue;   // 与 paintPixel 的本层蒙版语义一致
         shPrevIdx_.push_back(id);
-        shPrevOld_.push_back(canvas_.getPixelL(layer, x, y));
-        raster::paintPixel(canvas_, layer, x, y, color, false);
+        shPrevOld_.push_back(old);
+        raster::overPixel(tp[off], color);
         bx0 = std::min(bx0, x); bx1 = std::max(bx1, x);
         by0 = std::min(by0, y); by1 = std::max(by1, y);
     }
@@ -6568,15 +6623,20 @@ void Engine::composeFrameCell(int f, int scale, std::vector<uint32_t>& cell, int
     if (f != frame_) {
         if (frameCanvasForExport(f, tmp)) src = &tmp;
     }
+    // 导出合成走快路径(普通层/不透明度100%/正常混合/无裁剪): 每像素省掉蒙版/图层属性/混合模式判断
+    const bool fast = raster::composeLayersFastEligible(*src, false, false, true);
+    auto pixel = [&](int x, int y) -> uint32_t {
+        return fast ? raster::composeLayersPixelFast(*src, x, y)
+                    : raster::composeLayersPixelEx(*src, x, y, false, false);
+    };
     if (scale == 1) {
         for (int y = 0; y < ch; y++)
             for (int x = 0; x < cw; x++)
-                cell[(size_t)y * cw + x] = raster::composeLayersPixelEx(*src, x, y, false, false);
+                cell[(size_t)y * cw + x] = pixel(x, y);
     } else {
         std::vector<uint32_t> row((size_t)cw);
         for (int y = 0; y < ch; y++) {
-            for (int x = 0; x < cw; x++)
-                row[(size_t)x] = raster::composeLayersPixelEx(*src, x, y, false, false);
+            for (int x = 0; x < cw; x++) row[(size_t)x] = pixel(x, y);
             for (int oy = 0; oy < scale; oy++) {
                 uint32_t* drow = cell.data() + (size_t)(y * scale + oy) * cellW;
                 for (int x = 0; x < cw; x++) {
@@ -6907,6 +6967,14 @@ void Engine::flushScreenDirty() {
     const int tx = canvas_.tilesX();
     const int cw = canvas_.width(), ch = canvas_.height();
     const float z = display_.zoom();
+    // 2.5D: 源像素会按层错位到 dest = src - off, 影响范围最多 (层数-1)*depth。
+    // 不扩边的话, 错位到相邻 mip tile/屏幕区域的改动不会被重算, 表现为 tile 边界残影。
+    int pad = 0;
+    {
+        const auto& g = raster::mode25D();
+        if (g.on && g.depth > 0 && canvas_.layers() > 1)
+            pad = (canvas_.layers() - 1) * g.depth;
+    }
     int visLevel = 0;
     if (z < 1.0f) {
         visLevel = (int)std::floor(std::log2(1.0f / std::max(z, 1e-6f)));
@@ -6924,14 +6992,14 @@ void Engine::flushScreenDirty() {
             if (x + w - 1 > x1) x1 = x + w - 1;
             if (y + h - 1 > y1) y1 = y + h - 1;
         }
-        mip_.invalidateRect(x0, y0, x1, y1);
-        markScreenRect(x0, y0, x1, y1);
+        mip_.invalidateRect(x0 - pad, y0 - pad, x1 + pad, y1 + pad);
+        markScreenRect(x0 - pad, y0 - pad, x1 + pad, y1 + pad);
     } else {
         for (int ti : nd) {
             const int x = (ti % tx) * Canvas::TILE, y = (ti / tx) * Canvas::TILE;
             const int w = std::min(Canvas::TILE, cw - x), h = std::min(Canvas::TILE, ch - y);
-            mip_.updateRect(x, y, x + w - 1, y + h - 1, visLevel);
-            markScreenRect(x, y, x + w - 1, y + h - 1);
+            mip_.updateRect(x - pad, y - pad, x + w - 1 + pad, y + h - 1 + pad, visLevel);
+            markScreenRect(x - pad, y - pad, x + w - 1 + pad, y + h - 1 + pad);
         }
     }
     canvas_.clearDirty();

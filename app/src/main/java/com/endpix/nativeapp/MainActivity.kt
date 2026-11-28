@@ -45,6 +45,7 @@ import com.endpix.nativeapp.ui.EP_SIDE_EXT18
 import com.endpix.nativeapp.ui.EP_SIDE_EXT32
 import com.endpix.nativeapp.ui.EP_SIDE_EXT60
 import com.endpix.nativeapp.ui.MixPickHub
+import com.endpix.nativeapp.ui.StatsHub
 import com.endpix.nativeapp.ui.mixMidpointColor
 import com.endpix.nativeapp.ui.PaletteHub
 import com.endpix.nativeapp.ui.PalettePreset
@@ -53,6 +54,28 @@ import com.endpix.nativeapp.ui.SidePalettePrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+
+// stats 轮询里高频变化的字段: 只更新顶栏 StatsHub, 从 MainScreen 的 stats 参数里剔掉。
+// 注意 native stats 的格式是 `ft=%.1f/%.1f`(没有 maxft=), 正则必须按实际格式匹配,
+// 否则替换失败, MainScreen 仍然每 500ms 重组一次。
+private val RE_STATS_FPS = Regex("""fps=(\d+)""")
+private val RE_STATS_COMP = Regex("""comp=([\d.]+)""")
+private val RE_STATS_VOLATILE = Regex(
+    """fps=\d+ ft=[\d.]+/[\d.]+ comp=[\d.]+ pend=\d+ drn=\d+ms jk=\d+""")
+// rss 每轮从 /proc/self/status 读, 会随内存分配波动; cv 是画布屏幕矩形(float 舍入可能 ±1)。
+// 两者都不参与 UI 状态, 从 MainScreen 的 stats 参数里抹平, 避免 2Hz 无谓整屏重组。
+private val RE_STATS_RSS = Regex("""rss=\d+MB""")
+private val RE_STATS_CV = Regex("""cv=-?\d+,-?\d+,-?\d+,-?\d+""")
+// parseStats 每 500ms 跑一次, 预编译避免反复编译正则
+private val RE_TOOL = Regex("""tool=(\d+)""")
+private val RE_POLYV = Regex("""polyv=(\d+)""")
+private val RE_MEASF = Regex("""measf=(\d+)""")
+private val RE_MEASSP = Regex("""meassp=(\d+)""")
+private val RE_LAYERS = Regex("""L(\d+) A""")
+private val RE_ACTIVE = Regex("""L\d+ A(\d+)""")
+private val RE_PSEQ = Regex("""pseq=(\d+)""")
+private val RE_PICK = Regex("""pick=([0-9A-Fa-f]{8})""")
+private val RE_PICKPREV = Regex("""pickprev=([0-9A-Fa-f]{8})""")
 
 class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
@@ -2688,6 +2711,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var sigIconLauncher: androidx.activity.result.ActivityResultLauncher<Array<String>>? = null
     private val pickingState = mutableStateOf(false)
     private var lastPickSeq = 0
+    // stats 去掉高频字段后的稳定串/图层元数据原文: 不变就跳过 Regex/字符串解析(空闲 UI 线程省一批)
+    private var lastStableStats = ""
+    private var lastLayerMetaRaw = ""
     private val gridOnState = mutableStateOf(true)
     private val watermarkState = mutableStateOf(com.endpix.nativeapp.ui.WatermarkSettings())
     private val canvasStyleState = mutableStateOf(com.endpix.nativeapp.ui.CanvasStyleSettings())
@@ -3058,6 +3084,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                         if (txt.trim() == "proxybatch") {
                             logFile.appendText("proxybatch start\n")
                             com.endpix.nativeapp.ui.ProxyHub.debugBatchInfo(ctx, logFile)
+                            f.writeText("")
+                            return
+                        }
+                        if (txt.trim() == "statdump") {
+                            logFile.appendText("statdump " + statsState.value + "\n")
                             f.writeText("")
                             return
                         }
@@ -3450,11 +3481,28 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     LaunchedEffect(Unit) {
                         while (true) {
                             val s = try { nativeStats() } catch (_: Throwable) { "" }
-                            statsState.value = s
-                            parseStats(s)
+                            // fps/合成只驱动顶栏 InfoPanel, 不进入 MainScreen 的 stats 参数;
+                            // 其余高频字段(fps/ft/comp/pend/drn/jk)替换成常量, 空闲时 stats 不变→不重组整屏。
+                            StatsHub.fpsText =
+                                (RE_STATS_FPS.find(s)?.groupValues?.get(1) ?: "--") + "fps"
+                            StatsHub.compText = RE_STATS_COMP.find(s)?.groupValues?.get(1) ?: "--"
+                            var stable = RE_STATS_VOLATILE.replace(
+                                s, "fps=0 ft=0.0/0.0 comp=0.0 pend=0 drn=0ms jk=0")
+                            stable = RE_STATS_RSS.replace(stable, "rss=0MB")
+                            stable = RE_STATS_CV.replace(stable, "cv=0,0,0,0")
+                            statsState.value = stable
+                            // 只有功能性字段变了才解析(空闲时每秒省掉一遍 Regex/字符串扫描)
+                            if (stable != lastStableStats) {
+                                lastStableStats = stable
+                                parseStats(s)
+                            }
                             try {
-                                val lm = parseLayerMeta(nativeLayerMeta())
-                                if (lm != layerMetaState.value) layerMetaState.value = lm
+                                val raw = nativeLayerMeta()
+                                if (raw != lastLayerMetaRaw) {
+                                    lastLayerMetaRaw = raw
+                                    val lm = parseLayerMeta(raw)
+                                    if (lm != layerMetaState.value) layerMetaState.value = lm
+                                }
                             } catch (_: Throwable) { }
                             // 缩略图版本: 小地图只在内容/帧变化时重建位图(避免每 300ms 无谓 JNI+Bitmap)
                             try {
@@ -3516,30 +3564,37 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                             val fastPoll = (selFlagState.intValue and 1) != 0 ||
                                 (toolState.intValue == 4 && shapeTypeState.intValue == 6) ||
                                 com.endpix.nativeapp.ui.GradHub.active
-                            delay(if (fastPoll) 16 else 50)
+                            delay(if (fastPoll) 16 else 100)
                         }
                     }
                     LaunchedEffect(Unit) {
                         while (true) {
                             kotlinx.coroutines.delay(1000)
                             val m = autoSaveMin
+                            StatsHub.autoSaveMin = m
                             if (m <= 0) {
                                 autoSaveRemainState.intValue = -1
                                 autoSaveSavingState.value = false
+                                StatsHub.autoSaveRemain = -1
+                                StatsHub.autoSaveSaving = false
                                 continue
                             }
                             val now = System.currentTimeMillis()
                             val total = m * 60_000L
                             val left = (lastAutoSaveMs + total - now + 999) / 1000
                             autoSaveRemainState.intValue = left.coerceAtLeast(0L).toInt()
+                            StatsHub.autoSaveRemain = autoSaveRemainState.intValue
                             if (started && !autoSaveSavingState.value && now - lastAutoSaveMs >= total) {
                                 autoSaveSavingState.value = true
+                                StatsHub.autoSaveSaving = true
                                 lastAutoSaveMs = now
                                 try {
                                     withContext(Dispatchers.IO) { saveActiveTab() }
                                 } catch (_: Throwable) { }
                                 autoSaveSavingState.value = false
+                                StatsHub.autoSaveSaving = false
                                 autoSaveRemainState.intValue = m * 60
+                                StatsHub.autoSaveRemain = m * 60
                             }
                         }
                     }
@@ -3549,10 +3604,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                             try {
                                 val mi = ActivityManager.MemoryInfo()
                                 am.getMemoryInfo(mi)
-                                memPctState.intValue =
-                                    ((mi.totalMem - mi.availMem) * 100 / mi.totalMem).toInt()
+                                val pct = ((mi.totalMem - mi.availMem) * 100 / mi.totalMem).toInt()
+                                memPctState.intValue = pct
+                                StatsHub.memPct = pct
                             } catch (_: Throwable) { }
-                            delay(2000)
+                            delay(3000)
                         }
                     }
                     // 无界面导出触发(调试): files/export 里写倍率, 导出到 files/export.png 并写 export.log
@@ -3688,7 +3744,6 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                         },
                         batteryPct = batteryPctState.intValue,
                         charging = chargingState.value,
-                        memPct = memPctState.intValue,
                         portraitLock = portraitLockState.value,
                         onPortraitLock = { on ->
                             portraitLockState.value = on
@@ -3738,8 +3793,6 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                         onPickProjectFolder = { pickProjectFolder() },
                         onClearProjectFolder = { clearProjectFolder() },
                         autoSaveMin = autoSaveMin,
-                        autoSaveRemain = autoSaveRemainState.intValue,
-                        autoSaveSaving = autoSaveSavingState.value,
                         onAutoSaveMin = { m -> setAutoSaveMin(m) },
                         onClearCanvas = { nativeNewDocument(0, 0) },
                         onResizeCanvas = { w, h, ax, ay ->
@@ -4328,20 +4381,20 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun parseStats(s: String) {
-        fun grab(pattern: String): Int? = Regex(pattern).find(s)?.groupValues?.get(1)?.toIntOrNull()
-        grab("""tool=(\d+)""")?.let { toolState.intValue = it }
-        grab("""polyv=(\d+)""")?.let { polyVertsState.intValue = it }
-        grab("""measf=(\d+)""")?.let { measureFixedState.value = it != 0 }
-        grab("""meassp=(\d+)""")?.let { measurePendingState.value = it != 0 }
-        grab("""L(\d+) A""")?.let { layersState.intValue = it }
-        Regex("""L\d+ A(\d+)""").find(s)?.groupValues?.get(1)?.toIntOrNull()?.let { activeState.intValue = it }
-        val pseq = grab("""pseq=(\d+)""") ?: 0
+        fun grab(r: Regex): Int? = r.find(s)?.groupValues?.get(1)?.toIntOrNull()
+        grab(RE_TOOL)?.let { toolState.intValue = it }
+        grab(RE_POLYV)?.let { polyVertsState.intValue = it }
+        grab(RE_MEASF)?.let { measureFixedState.value = it != 0 }
+        grab(RE_MEASSP)?.let { measurePendingState.value = it != 0 }
+        grab(RE_LAYERS)?.let { layersState.intValue = it }
+        RE_ACTIVE.find(s)?.groupValues?.get(1)?.toIntOrNull()?.let { activeState.intValue = it }
+        val pseq = grab(RE_PSEQ) ?: 0
         if (pseq != lastPickSeq) {
             lastPickSeq = pseq
             val mixN = pseq - MixPickHub.startSeq.intValue
-            val pick = Regex("""pick=([0-9A-Fa-f]{8})""").find(s)?.groupValues?.get(1)
+            val pick = RE_PICK.find(s)?.groupValues?.get(1)
                 ?.toLongOrNull(16)?.toInt()
-            val pickPrev = Regex("""pickprev=([0-9A-Fa-f]{8})""").find(s)?.groupValues?.get(1)
+            val pickPrev = RE_PICKPREV.find(s)?.groupValues?.get(1)
                 ?.toLongOrNull(16)?.toInt()
             if (pick != null) {
                 val c = toNativeColor(pick)   // 原生字节序 ↔ ARGB 对称交换
