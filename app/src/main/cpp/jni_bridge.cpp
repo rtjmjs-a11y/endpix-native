@@ -859,6 +859,35 @@ Java_com_endpix_nativeapp_MainActivity_nativeImportRegion(JNIEnv* env, jobject, 
     gEngine->setImportRegion(x, y, w, h, buf);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_endpix_nativeapp_MainActivity_nativeImportSlices(JNIEnv* env, jobject, jint w, jint frameH,
+                                                          jint layers, jint frames,
+                                                          jobjectArray names, jintArray layerW,
+                                                          jintArray layerH, jintArray px) {
+    if (!gEngine || !names || !layerW || !layerH || !px) return;
+    if (w <= 0 || frameH <= 0 || layers <= 0 || frames <= 0) return;
+    if (env->GetArrayLength(names) < layers ||
+        env->GetArrayLength(layerW) < layers ||
+        env->GetArrayLength(layerH) < layers) return;
+    std::vector<std::string> nm((size_t)layers);
+    for (int i = 0; i < layers; i++) {
+        jstring s = (jstring)env->GetObjectArrayElement(names, i);
+        if (s) {
+            const char* cs = env->GetStringUTFChars(s, nullptr);
+            if (cs) { nm[(size_t)i] = cs; env->ReleaseStringUTFChars(s, cs); }
+            env->DeleteLocalRef(s);
+        }
+    }
+    std::vector<int> lw((size_t)layers), lh((size_t)layers);
+    env->GetIntArrayRegion(layerW, 0, layers, lw.data());
+    env->GetIntArrayRegion(layerH, 0, layers, lh.data());
+    const jsize n = env->GetArrayLength(px);
+    std::vector<uint32_t> buf((size_t)n);
+    env->GetIntArrayRegion(px, 0, n, (jint*)buf.data());
+    gEngine->requestSliceImport(w, frameH, layers, frames, std::move(nm),
+                                std::move(lw), std::move(lh), std::move(buf));
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_endpix_nativeapp_MainActivity_nativeReadRegion(JNIEnv* env, jobject, jint x, jint y,
                                                         jint w, jint h) {

@@ -2094,6 +2094,37 @@ void Engine::setImportImage(int w, int h, const std::vector<uint32_t>& px) {
     if (queue_.size() < 4096) queue_.push_back({24, 0.0f, 0.0f, 0.0f});
 }
 
+// 叠层切片: 每张图一层(按文件/zip 顺序), 图内纵向按 frameH 切帧。
+// 层帧数不足时保持最后一帧, 这样 1 帧的静态层能在所有帧里显示。
+void Engine::requestSliceImport(int canvasW, int frameH, int layers, int frames,
+                                std::vector<std::string> names,
+                                std::vector<int> layerW, std::vector<int> layerH,
+                                std::vector<uint32_t> px) {
+    if (canvasW < 1 || canvasW > 16834 || frameH < 1 || frameH > 16834) return;
+    if (layers < 1 || layers > 32 || frames < 1 || frames > 512) return;
+    if ((int)names.size() < layers || (int)layerW.size() < layers || (int)layerH.size() < layers) return;
+    size_t total = 0;
+    for (int l = 0; l < layers; l++) {
+        if (layerW[(size_t)l] < 1 || layerH[(size_t)l] < 1) return;
+        total += (size_t)layerW[(size_t)l] * (size_t)layerH[(size_t)l];
+    }
+    if (total > 16u * 1024 * 1024 || px.size() < total) return;
+    {
+        std::lock_guard<std::mutex> lk(importMu_);
+        sliceImp_.w = canvasW;
+        sliceImp_.frameH = frameH;
+        sliceImp_.layers = layers;
+        sliceImp_.frames = frames;
+        sliceImp_.names = std::move(names);
+        sliceImp_.lw = std::move(layerW);
+        sliceImp_.lh = std::move(layerH);
+        sliceImp_.px = std::move(px);
+        sliceImpPending_ = true;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (queue_.size() < 4096) queue_.push_back({86, 0.0f, 0.0f, 0.0f});
+}
+
 void Engine::setImportTextImage(int w, int h, const std::vector<uint32_t>& px) {
     if (w <= 0 || h <= 0 || px.size() < (size_t)w * h) return;
     {
@@ -2157,6 +2188,133 @@ void Engine::setImportRegion(int x, int y, int w, int h, const std::vector<uint3
     }
     std::lock_guard<std::mutex> lk(mu_);
     if (queue_.size() < 4096) queue_.push_back({85, 0.0f, 0.0f, 0.0f});
+}
+
+namespace {
+// 把临时 Canvas 序列化成帧 blob(与 Engine::serializeCanvas 同格式)
+void serializeCanvasLocal(const Canvas& c, std::vector<uint8_t>& out) {
+    auto put32 = [&](uint32_t v) {
+        out.push_back((uint8_t)(v & 255)); out.push_back((uint8_t)((v >> 8) & 255));
+        out.push_back((uint8_t)((v >> 16) & 255)); out.push_back((uint8_t)((v >> 24) & 255));
+    };
+    const int lc = c.layers();
+    put32((uint32_t)lc); put32((uint32_t)c.active());
+    put32((uint32_t)c.liveTileCount());
+    for (int l = 0; l < lc; l++) {
+        for (int ti = 0; ti < c.tilesX() * c.tilesY(); ti++) {
+            const bool solid = c.isSolidTile(l, ti);
+            const uint32_t* px = c.tile(l, ti);
+            if (!solid && !px) continue;
+            put32((uint32_t)l); put32((uint32_t)ti);
+            if (solid) {
+                put32(1u); put32(c.solidTileColor(l, ti));
+            } else {
+                put32(0u);
+                const size_t off = out.size();
+                out.resize(off + Canvas::TILE_PIX * 4);
+                memcpy(out.data() + off, px, Canvas::TILE_PIX * 4);
+            }
+        }
+    }
+}
+} // namespace
+
+// 叠层切片导入(渲染线程): 每张图一层, 图内纵向切帧; 层帧数不足时保持最后一帧。
+void Engine::doSliceImport() {
+    SliceImportData d;
+    {
+        std::lock_guard<std::mutex> lk(importMu_);
+        if (!sliceImpPending_) return;
+        d = std::move(sliceImp_);
+        sliceImp_ = SliceImportData();
+        sliceImpPending_ = false;
+    }
+    const int W = d.w, H = d.frameH, N = d.layers, F = d.frames;
+    if (W < 1 || H < 1 || N < 1 || F < 1) return;
+    if ((int)d.lw.size() < N || (int)d.lh.size() < N) return;
+    std::vector<size_t> off((size_t)N, 0);
+    size_t total = 0;
+    for (int l = 0; l < N; l++) {
+        off[(size_t)l] = total;
+        total += (size_t)d.lw[(size_t)l] * (size_t)d.lh[(size_t)l];
+    }
+    if (d.px.size() < total) return;
+    std::vector<int> layerFrames((size_t)N, 1);
+    for (int l = 0; l < N; l++) layerFrames[(size_t)l] = std::max(1, d.lh[(size_t)l] / H);
+
+    Canvas tmp;
+    if (!tmp.create(W, H, N)) return;
+    const int tts = tmp.tilesX() * tmp.tilesY();
+    std::vector<std::vector<uint8_t>> frames((size_t)F);
+    for (int f = 0; f < F; f++) {
+        for (int l = 0; l < N; l++)
+            for (int ti = 0; ti < tts; ti++) tmp.releaseTile(l, ti);
+        for (int l = 0; l < N; l++) {
+            const int sw = d.lw[(size_t)l], sh = d.lh[(size_t)l];
+            const int sf = std::min(f, layerFrames[(size_t)l] - 1);
+            const int srcY = sf * H;
+            const int copyW = std::min(W, sw);
+            const int copyH = std::min(H, sh - srcY);
+            if (copyW <= 0 || copyH <= 0) continue;
+            const uint32_t* base = d.px.data() + off[(size_t)l];
+            for (int y = 0; y < copyH; y++) {
+                const uint32_t* row = base + (size_t)(srcY + y) * sw;
+                int x = 0;
+                while (x < copyW) {
+                    if (!row[x]) { x++; continue; }
+                    const int run = std::min(copyW - x, Canvas::TILE - (x & (Canvas::TILE - 1)));
+                    uint32_t* t = tmp.tileForWrite(l, (y >> Canvas::TILE_SHIFT) * tmp.tilesX() +
+                                                       (x >> Canvas::TILE_SHIFT));
+                    memcpy(t + ((size_t)(y & (Canvas::TILE - 1)) << Canvas::TILE_SHIFT) +
+                               (x & (Canvas::TILE - 1)), row + x, (size_t)run * 4);
+                    x += run;
+                }
+            }
+        }
+        frames[(size_t)f].reserve((size_t)32 + (size_t)N * (Canvas::TILE_PIX * 4 + 16));
+        serializeCanvasLocal(tmp, frames[(size_t)f]);
+    }
+
+    // 一次性替换当前工程
+    sel_.clearState();
+    sel_.deselect();
+    canvas_.clearCutRect();
+    canvas_.create(W, H, N);
+    deserializeCanvas(frames[0].data(), frames[0].size());
+    frameData_.swap(frames);
+    frame_ = 0;
+    frameIdx_.store(0);
+    frameCount_.store(F);
+    playing_.store(0);
+    playFps_.store(8);
+    loopStart_.store(0);
+    loopEnd_.store(F - 1);
+    frameLayerCount_ = N;
+    layerCount_.store(N);
+    activeLayer_.store(0);
+    for (int l = 0; l < N; l++) {
+        if (l < (int)d.names.size() && !d.names[(size_t)l].empty())
+            canvas_.setLayerName(l, d.names[(size_t)l]);
+        canvas_.setLayerVisible(l, true);
+        canvas_.setLayerLocked(l, false);
+        canvas_.setLayerMode(l, 0);
+        canvas_.setLayerBlend(l, 0);
+        canvas_.setLayerOpacity(l, 1.f);
+    }
+    clearHistory();
+    display_.resizeCanvas(W, H);
+    display_.resetView();
+    mip_.reset(&canvas_);
+    mip_.invalidateRect(0, 0, W - 1, H - 1);
+    layerMetaRev_++;
+    refreshLayerMetaCache();
+    refreshLayerPropsCache();
+    lastSavedRev_.store(0);
+    frameRev_.fetch_add(1);
+    thumbRev_.fetch_add(1);
+    screenFull_ = true;
+    refreshFrameThumbs();
+    LOGI("slice import %dx%d layers=%d frames=%d frameH=%d", W, H, N, F, H);
 }
 
 // 选区内容整体旋转/翻转(即时提交, 走撤销记录)
@@ -3523,6 +3681,10 @@ void Engine::drainInput() {
                     canvas_.markDirtyRect(x0, y0, x1 - 1, y1 - 1);
                 }
             }
+            continue;
+        }
+        if (e.action == 86) {   // 叠层切片导入: 一次性替换为多图层/多帧工程
+            doSliceImport();
             continue;
         }
         if (e.action == 34) { sel_.copyRect(); lastCutSkip_.store(sel_.lastCutSkipped()); continue; }

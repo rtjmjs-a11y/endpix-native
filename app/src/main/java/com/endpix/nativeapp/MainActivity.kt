@@ -1975,6 +1975,108 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         try { nativeAnimateViewCenter(cx, cy, if (animate) 1 else 0) } catch (_: Throwable) { }
     }
 
+    // ---- 叠层切片 zip 导入: 每张图一层(按 zip 文件顺序), 图内纵向按用户输入的帧高切帧 ----
+    private fun looksLikeZip(f: java.io.File, name: String): Boolean {
+        if (name.endsWith(".zip", true)) return true
+        return try {
+            java.io.FileInputStream(f).use { ins ->
+                val b = ByteArray(4)
+                ins.read(b) >= 4 && b[0].toInt() == 0x50 && b[1].toInt() == 0x4B &&
+                    (b[2].toInt() == 3 || b[2].toInt() == 5 || b[2].toInt() == 7)
+            }
+        } catch (_: Throwable) { false }
+    }
+
+    private class SliceLayer(val name: String, val w: Int, val h: Int, val px: IntArray)
+
+    private fun gcdInt(a: Int, b: Int): Int {
+        var x = kotlin.math.abs(a)
+        var y = kotlin.math.abs(b)
+        while (y != 0) { val t = x % y; x = y; y = t }
+        return if (x <= 0) 1 else x
+    }
+
+    // 运行在加载线程: 解 zip -> 解码每张图 -> 拼成按层展开的像素数组; 然后弹帧高输入框
+    private fun prepareSliceImport(f: java.io.File) {
+        val layers = ArrayList<SliceLayer>()
+        var total = 0L
+        try {
+            java.util.zip.ZipFile(f).use { zf ->
+                val en = zf.entries()
+                while (en.hasMoreElements()) {
+                    val e = en.nextElement()
+                    if (e.isDirectory) continue
+                    val nm = e.name.lowercase(java.util.Locale.ROOT)
+                    if (!(nm.endsWith(".png") || nm.endsWith(".jpg") || nm.endsWith(".jpeg") ||
+                          nm.endsWith(".webp") || nm.endsWith(".bmp"))) continue
+                    if (e.size > 32L * 1024 * 1024) continue
+                    val bytes = try { zf.getInputStream(e).use { it.readBytes() } } catch (_: Throwable) { null } ?: continue
+                    val bmp = try { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } catch (_: Throwable) { null } ?: continue
+                    val w = bmp.width
+                    val h = bmp.height
+                    if (w <= 0 || h <= 0 || w > 16834 || h > 16834) { bmp.recycle(); continue }
+                    if (total + w.toLong() * h > 16_000_000L) { bmp.recycle(); break }
+                    val argb = IntArray(w * h)
+                    bmp.getPixels(argb, 0, w, 0, 0, w, h)
+                    bmp.recycle()
+                    for (i in argb.indices) {
+                        val c = argb[i]
+                        argb[i] = (c and 0xFF00FF00.toInt()) or ((c and 0xFF) shl 16) or ((c ushr 16) and 0xFF)
+                    }
+                    var base = e.name.substringAfterLast('/').trimStart('.')
+                    val dot = base.lastIndexOf('.')
+                    if (dot > 0) base = base.substring(0, dot)
+                    if (base.isBlank()) base = "层${layers.size}"
+                    layers.add(SliceLayer(base, w, h, argb))
+                    total += w.toLong() * h
+                    if (layers.size >= 32) break
+                }
+            }
+        } catch (_: Throwable) { }
+        if (layers.isEmpty()) {
+            runOnUiThread {
+                android.widget.Toast.makeText(this, "zip 里没有可用图片切片",
+                    android.widget.Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        val maxW = layers.maxOf { it.w }
+        val minH = layers.minOf { it.h }
+        var g = layers[0].h
+        for (l in layers) g = gcdInt(g, l.h)
+        val defH = if (g in 1..minH) g else minH
+        val flat = IntArray(total.toInt())
+        var off = 0
+        for (l in layers) { l.px.copyInto(flat, off); off += l.px.size }
+        val names = layers.map { it.name }
+        val ws = IntArray(layers.size) { layers[it].w }
+        val hs = IntArray(layers.size) { layers[it].h }
+        runOnUiThread {
+            if (!canAddTab()) return@runOnUiThread
+            com.endpix.nativeapp.ui.SliceImportHub.show(names, ws, hs, flat, defH) { fh ->
+                importSliceProject(maxW, fh, names, ws, hs, flat)
+            }
+        }
+    }
+
+    private fun importSliceProject(w: Int, frameH: Int, names: List<String>,
+                                   widths: IntArray, heights: IntArray, px: IntArray) {
+        val layers = names.size
+        if (layers <= 0 || w <= 0 || frameH <= 0) return
+        var frames = 1
+        for (i in 0 until layers) frames = maxOf(frames, (heights[i] / frameH).coerceAtLeast(1))
+        if (!addTab(w, frameH)) return
+        val id = activeTabState.intValue
+        renameTab(id, "切片${w}×$frameH".take(12))
+        noteTabSize(id, w, frameH)
+        try {
+            nativeImportSlices(w, frameH, layers, frames, names.toTypedArray(), widths, heights, px)
+        } catch (_: Throwable) { }
+        handler.postDelayed({ saveActiveTab() }, 800)
+        android.widget.Toast.makeText(this, "已导入 ${layers} 层 / ${frames} 帧 ($w×$frameH)",
+            android.widget.Toast.LENGTH_LONG).show()
+    }
+
     private fun doLoadFile(uri: android.net.Uri) {
         val name = displayName(uri)
         Thread {
@@ -1999,6 +2101,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     }
                 } else if (copied && isSnapFile(tmp)) {
                     runOnUiThread { openProjectAsNewTab(tmp, name) }
+                } else if (copied && looksLikeZip(tmp, name)) {
+                    prepareSliceImport(tmp)
                 } else {
                     val b = imageBounds(uri)
                     if (b != null) {
@@ -2883,6 +2987,13 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                             com.endpix.nativeapp.ui.BrowserHub.navigate(u)
                             logFile.appendText("browser -> $u\n")
                             f.writeText("")
+                            return
+                        }
+                        if (bcmd.startsWith("loadfile ")) {
+                            val p = bcmd.removePrefix("loadfile ").trim()
+                            logFile.appendText("loadfile -> $p\n")
+                            f.writeText("")
+                            doLoadFile(android.net.Uri.fromFile(java.io.File(p)))
                             return
                         }
                         if (nativeDebugScript(txt, logFile.absolutePath)) f.writeText("")
@@ -3847,6 +3958,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     )
                     }
                 }
+                // 叠层切片导入对话框(加载文件选中 zip 后弹出)
+                com.endpix.nativeapp.ui.SliceImportDialog()
                 }
             }
         }
@@ -4557,6 +4670,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private external fun nativeResize(vw: Int, vh: Int)
     private external fun nativeRequestRedraw()
     private external fun nativeImportRegion(x: Int, y: Int, w: Int, h: Int, px: IntArray)
+    private external fun nativeImportSlices(w: Int, frameH: Int, layers: Int, frames: Int,
+                                            names: Array<String>, layerW: IntArray,
+                                            layerH: IntArray, px: IntArray)
     private external fun nativeCanvasSize(): IntArray?
     private external fun nativeSnapshotDims(path: String): IntArray?
     private external fun nativeFrameCount(): Int

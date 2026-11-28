@@ -307,6 +307,11 @@ public:
     void setImportImage(int w, int h, const std::vector<uint32_t>& px);
     void setImportTextImage(int w, int h, const std::vector<uint32_t>& px);
     void setImportRegion(int x, int y, int w, int h, const std::vector<uint32_t>& px);
+    // 叠层切片导入: 每张图一层(按文件顺序), 图内纵向按 frameH 切帧; 层内帧数不足时保持最后一帧
+    void requestSliceImport(int canvasW, int frameH, int layers, int frames,
+                            std::vector<std::string> names,
+                            std::vector<int> layerW, std::vector<int> layerH,
+                            std::vector<uint32_t> px);
     void requestFlip(bool horizontal);
     void requestGrayscale();
     // 灰度观看(只改屏幕显示, 不动画布像素)
@@ -594,6 +599,16 @@ private:
     std::vector<uint32_t> impRegPx_;
     int impRegX_ = 0, impRegY_ = 0, impRegW_ = 0, impRegH_ = 0;
     bool impRegPending_ = false;
+    // 叠层切片: 一次性替换当前画布为多图层/多帧工程
+    struct SliceImportData {
+        int w = 0, frameH = 0, layers = 0, frames = 0;
+        std::vector<std::string> names;
+        std::vector<int> lw, lh;
+        std::vector<uint32_t> px;
+    };
+    SliceImportData sliceImp_;
+    bool sliceImpPending_ = false;
+    void doSliceImport();
     // 抽屉颜色调整/像素描边参数
     std::mutex selOpMu_;
     bool selAdjPending_ = false;
