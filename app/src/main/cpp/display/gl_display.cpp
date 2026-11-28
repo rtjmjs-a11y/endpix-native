@@ -66,7 +66,9 @@ static const char* FS =
     "  vec2 gCell = max(vec2(uGridW, uGridH) * uZoom, vec2(4.0));\n"
     "  vec2 gq = vec2(cx * uZoom / gCell.x, cy * uZoom / gCell.y);\n"
     "  vec2 gf = fract(gq);\n"
-    "  vec2 glw = max(vec2(uGridLineW), vec2(0.5)) / gCell;\n"
+    // 线宽至少 1 屏幕px(2.5D 旋转 1.5px): 0.9px 在低缩放下会周期性落在两像素之间, 整条线丢失
+    "  float minLw = 1.0 + 0.5 * step(0.0001, abs(uRot));\n"
+    "  vec2 glw = max(vec2(uGridLineW), vec2(minLw)) / gCell;\n"
     "  float line = min(step(gf.x, glw.x) + step(gf.y, glw.y), 1.0) * uGridOn * step(6.0, min(gCell.x, gCell.y));\n"
     "  float insideAxis = step(uCanvasRect.x, gl_FragCoord.x) * step(gl_FragCoord.x, uCanvasRect.z)\n"
     "               * step(uCanvasRect.y, gl_FragCoord.y) * step(gl_FragCoord.y, uCanvasRect.w);\n"

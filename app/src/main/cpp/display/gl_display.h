@@ -98,8 +98,10 @@ public:
         bakeInvChk_ = bakeChkFast_ ? 1.0f / chkTile_ : 1.0f;
         bakeInvGw_ = gridW_ > 0.001f ? 1.0f / gridW_ : 1.0f;
         bakeInvGh_ = gridH_ > 0.001f ? 1.0f / gridH_ : 1.0f;
-        // 线宽按屏幕 px 定义, 换算到画布单位比较
-        bakeLwC_ = std::max(gridLineW_, 0.5f) / std::max(zoom_, 1e-4f);
+        // 线宽按屏幕 px 定义, 换算到画布单位比较; 至少 1 屏幕px(旋转 1.5px),
+        // 否则 0.9px 在低缩放下会周期性落在两个采样点之间, 整条网格线丢失
+        const float minLw = 1.0f + (std::fabs(rot25Deg_) > 0.01f ? 0.5f : 0.0f);
+        bakeLwC_ = std::max(gridLineW_, minLw) / std::max(zoom_, 1e-4f);
         auto to8 = [](float v) -> int {
             const int x = (int)(v * 255.0f + (v >= 0.0f ? 0.5f : -0.5f));
             return x < 0 ? 0 : (x > 255 ? 255 : x);
