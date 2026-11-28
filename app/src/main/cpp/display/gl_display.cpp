@@ -296,6 +296,52 @@ bool GlDisplay::createTexture() {
     if (!useAhb_) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, dw_, dh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         LOGI("plain texture %dx%d", dw_, dh_);
+    } else {
+        // 第二块屏幕缓冲: 写入后备, 成功后再交换; 失败则退回单缓冲
+        GLuint tb = 0;
+        glGenTextures(1, &tb);
+        glBindTexture(GL_TEXTURE_2D, tb);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        AHardwareBuffer_Desc d{};
+        d.width = dw_; d.height = dh_; d.layers = 1;
+        d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        d.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+        bool okB = false;
+        if (AHardwareBuffer_allocate(&d, &ahbB_) == 0) {
+            EGLClientBuffer cb = pGetCb(ahbB_);
+            const EGLint attrs[] = { EGL_IMAGE_PRESERVED_KHR, 1, EGL_NONE };
+            imgB_ = pCreateImg(dpy_, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, cb, attrs);
+            if (imgB_ != EGL_NO_IMAGE_KHR) {
+                pImgTarget(GL_TEXTURE_2D, imgB_);
+                if (glGetError() == GL_NO_ERROR) {
+                    okB = true;
+                    GLuint fbo = 0;
+                    glGenFramebuffers(1, &fbo);
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tb, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glDeleteFramebuffers(1, &fbo);
+                    glClearColor(0.05f, 0.067f, 0.09f, 1.0f);
+                }
+            }
+        }
+        if (okB) {
+            texB_ = tb;
+            writeB_ = true; readB_ = false;   // 先写后备 B, A 作为当前显示
+            LOGI("AHB screen double buffer ready");
+        } else {
+            if (imgB_ != EGL_NO_IMAGE_KHR && pDestroyImg) { pDestroyImg(dpy_, imgB_); imgB_ = EGL_NO_IMAGE_KHR; }
+            if (ahbB_) { AHardwareBuffer_release(ahbB_); ahbB_ = nullptr; }
+            if (tb) glDeleteTextures(1, &tb);
+        }
+        glBindTexture(GL_TEXTURE_2D, tex_);
     }
     // staging 不再按整画布分配(16383² ≈ 1GB, 每次启动清零要几百 ms), 改成按上传矩形复用
     staging_.assign((size_t)dw_ * dh_, 0u);
@@ -306,13 +352,15 @@ void GlDisplay::shutdown() {
     if (dpy_ != EGL_NO_DISPLAY) {
         eglMakeCurrent(dpy_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (img_ != EGL_NO_IMAGE_KHR && pDestroyImg) { pDestroyImg(dpy_, img_); img_ = EGL_NO_IMAGE_KHR; }
+        if (imgB_ != EGL_NO_IMAGE_KHR && pDestroyImg) { pDestroyImg(dpy_, imgB_); imgB_ = EGL_NO_IMAGE_KHR; }
         if (surf_ != EGL_NO_SURFACE) eglDestroySurface(dpy_, surf_);
         if (ctx_ != EGL_NO_CONTEXT) eglDestroyContext(dpy_, ctx_);
         eglTerminate(dpy_);
     }
     surf_ = EGL_NO_SURFACE; ctx_ = EGL_NO_CONTEXT; dpy_ = EGL_NO_DISPLAY;
+    if (ahbB_) { AHardwareBuffer_release(ahbB_); ahbB_ = nullptr; }
     if (ahb_) { AHardwareBuffer_release(ahb_); ahb_ = nullptr; }
-    tex_ = prog_ = vbo_ = 0;
+    tex_ = texB_ = prog_ = vbo_ = 0;
     win_ = nullptr;
 }
 
@@ -335,8 +383,12 @@ void GlDisplay::onSize(int w, int h) {
     if (resized) {
         // 横竖屏切换: 屏幕缓冲/纹理/AHB 必须按新尺寸重建, 否则仍按旧宽高采样=强制拉伸
         if (img_ != EGL_NO_IMAGE_KHR && pDestroyImg) { pDestroyImg(dpy_, img_); img_ = EGL_NO_IMAGE_KHR; }
+        if (imgB_ != EGL_NO_IMAGE_KHR && pDestroyImg) { pDestroyImg(dpy_, imgB_); imgB_ = EGL_NO_IMAGE_KHR; }
+        if (ahbB_) { AHardwareBuffer_release(ahbB_); ahbB_ = nullptr; }
         if (ahb_) { AHardwareBuffer_release(ahb_); ahb_ = nullptr; }
+        if (texB_) { glDeleteTextures(1, &texB_); texB_ = 0; }
         if (tex_) { glDeleteTextures(1, &tex_); tex_ = 0; }
+        writeB_ = readB_ = false;
         useAhb_ = false;
         dw_ = w; dh_ = h; texW_ = w; texH_ = h;
         if (dpy_ != EGL_NO_DISPLAY) createTexture();
@@ -485,23 +537,35 @@ bool GlDisplay::endUpdate() {
     if (!updating_) return false;
     updating_ = false;
     if (useAhb_) {
+        if (!ahbB_) writeB_ = false;
         ARect r{ upX_, upY_, upX_ + upW_, upY_ + upH_ };
-        void* p = nullptr;
-        if (AHardwareBuffer_lock(ahb_, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, &r, &p) != 0) {
-            // 横竖屏重建 AHB 的那几帧, 合成器可能还占着缓冲: 锁失败不能把"已重绘"标记清掉,
-            // 否则屏幕会一直停在空白 AHB 上, 直到下一次输入才重绘。
+        bool uploaded = false;
+        for (int attempt = 0; attempt < 2 && !uploaded; attempt++) {
+            AHardwareBuffer* w = writeB_ ? ahbB_ : ahb_;
+            if (!w) { writeB_ = !writeB_; continue; }
+            void* p = nullptr;
+            if (AHardwareBuffer_lock(w, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, &r, &p) != 0) {
+                // 当前写缓冲被合成器占着: 尝试另一块; 两块都失败下一帧再试
+                writeB_ = !writeB_;
+                continue;
+            }
+            const uint8_t* src = (const uint8_t*)upPtr_;
+            // lock(rect) 返回缓冲区基址, 目标要自己加矩形偏移
+            uint8_t* dst = (uint8_t*)p + ((size_t)upY_ * ahbStride_ + upX_) * 4;
+            const int strideBytes = ahbStride_ * 4;
+            const int rowBytes = upW_ * 4;
+            for (int y = 0; y < upH_; y++)
+                memcpy(dst + (size_t)y * strideBytes, src + (size_t)y * dw_ * 4, rowBytes);
+            AHardwareBuffer_unlock(w, nullptr);
+            readB_ = writeB_;
+            writeB_ = !writeB_;
+            uploaded = true;
+        }
+        if (!uploaded) {
             static int lockFailLog = 0;
             if (lockFailLog < 3) { LOGI("AHB lock fail, retry next frame"); lockFailLog++; }
             return false;
         }
-        const uint8_t* src = (const uint8_t*)upPtr_;
-        // lock(rect) 返回缓冲区基址, 目标要自己加矩形偏移
-        uint8_t* dst = (uint8_t*)p + ((size_t)upY_ * ahbStride_ + upX_) * 4;
-        const int strideBytes = ahbStride_ * 4;
-        const int rowBytes = upW_ * 4;
-        for (int y = 0; y < upH_; y++)
-            memcpy(dst + (size_t)y * strideBytes, src + (size_t)y * dw_ * 4, rowBytes);
-        AHardwareBuffer_unlock(ahb_, nullptr);
     } else {
         if (!tex_) return false;
         glBindTexture(GL_TEXTURE_2D, tex_);
@@ -747,7 +811,7 @@ void GlDisplay::draw() {
                 (float)loupeX1_, (float)(vh_ - loupeY0_));
     glUniform1i(uTex_, 0);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_);
+    glBindTexture(GL_TEXTURE_2D, screenTex());
     glBindBuffer(GL_ARRAY_BUFFER, vbo_);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
@@ -767,7 +831,7 @@ void GlDisplay::draw() {
         glUniform2f(uUvScale_, (float)floatW_ / texW_, (float)floatH_ / texH_);
         glUniform2f(uUvOffset_, (float)floatSrcX_ / texW_, (float)floatSrcY_ / texH_);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, tex_);
+        glBindTexture(GL_TEXTURE_2D, screenTex());
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);

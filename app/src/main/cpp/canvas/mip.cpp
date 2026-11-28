@@ -21,6 +21,12 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
+    int singleLayer = -2;
+    if (fastCompose) {
+        int cnt = 0;
+        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; }
+        if (cnt != 1) singleLayer = -2;
+    }
     for (int y = 0; y < TS; y++) {
         const int cy = y0 + y * stride;
         uint32_t* drow = buf.get() + (size_t)y * TS;
@@ -28,8 +34,9 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
         for (int x = 0; x < TS; x++) {
             const int cx = x0 + x * stride;
             if (cx >= cw) { drow[x] = 0; continue; }
-            drow[x] = fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
-                                  : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+            drow[x] = singleLayer >= 0 ? canvas_->getPixelL(singleLayer, cx, cy)
+                      : (fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
+                                     : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false));
         }
     }
     {
@@ -52,6 +59,12 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
+    int singleLayer = -2;
+    if (fastCompose) {
+        int cnt = 0;
+        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) { singleLayer = l; cnt++; }
+        if (cnt != 1) singleLayer = -2;
+    }
     for (int level = 0; level < 6; level++) {
         const bool recompute = (visibleLevel < 0 || visibleLevel == level);
         const int span = TS << level;
@@ -78,8 +91,9 @@ void MipPyramid::updateRect(int x0, int y0, int x1, int y1, int visibleLevel) {
                         const int cx = bx + (lx << level);
                         uint32_t acc = 0;
                         if (cx < cw && cy < ch)
-                            acc = fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
-                                              : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false);
+                            acc = singleLayer >= 0 ? canvas_->getPixelL(singleLayer, cx, cy)
+                                  : (fastCompose ? raster::composeLayersPixelFast(*canvas_, cx, cy)
+                                                 : raster::composeLayersPixelEx(*canvas_, cx, cy, true, true, false));
                         t[(size_t)ly * TS + lx] = acc;
                     }
                 }

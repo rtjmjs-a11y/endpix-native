@@ -221,7 +221,13 @@ private:
     bool useAhb_ = false;
     AHardwareBuffer* ahb_ = nullptr;
     EGLImageKHR img_ = EGL_NO_IMAGE_KHR;
+    // 第二块屏幕 AHB: 写后备, 避免和合成器抢同一块 buffer
+    AHardwareBuffer* ahbB_ = nullptr;
+    EGLImageKHR imgB_ = EGL_NO_IMAGE_KHR;
+    GLuint texB_ = 0;
+    bool writeB_ = false, readB_ = false;
     int ahbStride_ = 0;
+    GLuint screenTex() const { return (useAhb_ && readB_ && texB_) ? texB_ : tex_; }
 
     std::vector<uint32_t> staging_;  // 兜底路径
     bool updating_ = false;
