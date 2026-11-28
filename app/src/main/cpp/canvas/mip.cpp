@@ -1,5 +1,6 @@
 #include "mip.h"
 #include "../raster/raster.h"
+#include <cmath>
 #include <cstring>
 
 namespace endpix {
@@ -21,7 +22,65 @@ const uint32_t* MipPyramid::tile(int level, int tx, int ty) {
     const int cw = canvas_->width(), ch = canvas_->height();
     const int nl = canvas_->layers();
     const bool fastCompose = raster::composeLayersFastEligible(*canvas_, true, true, false);
-    if (fastCompose) {
+    const raster::Mode25D& g = raster::mode25D();
+    const bool d25 = g.on && g.depth > 0 && nl > 1;
+    if (fastCompose && d25) {
+        std::vector<int> vis;
+        vis.reserve(nl);
+        for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) vis.push_back(l);
+        const int nv = (int)vis.size();
+        const int ctx = canvas_->tilesX();
+        std::vector<int> oxs(nv), oys(nv);
+        for (int i = 0; i < nv; i++) {
+            const int off = vis[i] * g.depth;
+            oxs[i] = (int)std::lround(g.offX * off);
+            oys[i] = (int)std::lround(g.offY * off);
+        }
+        std::vector<const uint32_t*> ptrs(nv);
+        std::vector<uint32_t> scols(nv);
+        std::vector<uint8_t> solids(nv), rowOk(nv);
+        std::vector<int> lastTx(nv), tyi(nv), lyv(nv);
+        for (int y = 0; y < TS; y++) {
+            const int cy = y0 + y * stride;
+            uint32_t* drow = buf.get() + (size_t)y * TS;
+            for (int i = 0; i < nv; i++) {
+                const int sy = cy - oys[i];
+                rowOk[i] = (sy >= 0 && sy < ch && cy < ch) ? 1 : 0;
+                if (rowOk[i]) {
+                    tyi[i] = sy >> Canvas::TILE_SHIFT;
+                    lyv[i] = sy & (Canvas::TILE - 1);
+                    lastTx[i] = -1;
+                } else {
+                    lastTx[i] = -2;
+                }
+            }
+            for (int x = 0; x < TS; x++) {
+                const int cx = x0 + x * stride;
+                if (cx >= cw) { drow[x] = 0; continue; }
+                uint32_t acc = 0;
+                for (int i = 0; i < nv; i++) {
+                    if (!rowOk[i]) continue;
+                    const int sx = cx - oxs[i];
+                    if (sx < 0 || sx >= cw) continue;
+                    const int tx = sx >> Canvas::TILE_SHIFT;
+                    if (tx != lastTx[i]) {
+                        const int ti = tyi[i] * ctx + tx;
+                        const int l = vis[i];
+                        const bool s = canvas_->isSolidTile(l, ti);
+                        solids[i] = s ? 1 : 0;
+                        scols[i] = s ? canvas_->solidTileColor(l, ti) : 0;
+                        ptrs[i] = s ? nullptr : canvas_->tile(l, ti);
+                        lastTx[i] = tx;
+                    }
+                    const uint32_t v = solids[i] ? scols[i]
+                        : (ptrs[i] ? ptrs[i][((size_t)lyv[i] << Canvas::TILE_SHIFT) +
+                                            (sx & (Canvas::TILE - 1))] : 0);
+                    if (v) raster::overPixel(acc, v);
+                }
+                drow[x] = acc;
+            }
+        }
+    } else if (fastCompose) {
         std::vector<int> vis;
         vis.reserve(nl);
         for (int l = 0; l < nl; l++) if (canvas_->layerVisible(l)) vis.push_back(l);

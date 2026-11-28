@@ -196,10 +196,6 @@ bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, boo
     if (!gFastCompose.load(std::memory_order_relaxed)) return false;
     const int nl = c.layers();
     if (nl <= 0) return false;
-    if (view25d) {
-        const Mode25D& g = mode25D();
-        if (g.on && g.depth > 0 && nl > 1) return false;
-    }
     if (applyCut && c.cutActive()) return false;
     for (int l = 0; l < nl; l++) {
         if (!c.layerVisible(l)) continue;
@@ -212,11 +208,20 @@ bool composeLayersFastEligible(const Canvas& c, bool showGrid, bool view25d, boo
 }
 
 uint32_t composeLayersPixelFast(const Canvas& c, int x, int y) {
-    uint32_t acc = 0;
     const int nl = c.layers();
+    const Mode25D& g = mode25D();
+    const bool d25 = g.on && g.depth > 0 && nl > 1;
+    uint32_t acc = 0;
     for (int l = 0; l < nl; l++) {
         if (!c.layerVisible(l)) continue;
-        const uint32_t v = c.getPixelL(l, x, y);
+        int sx = x, sy = y;
+        if (d25) {
+            const int off = l * g.depth;
+            sx -= (int)std::lround(g.offX * off);
+            sy -= (int)std::lround(g.offY * off);
+            if ((unsigned)sx >= (unsigned)c.width() || (unsigned)sy >= (unsigned)c.height()) continue;
+        }
+        const uint32_t v = c.getPixelL(l, sx, sy);
         if (v) overPixel(acc, v);
     }
     return acc;
